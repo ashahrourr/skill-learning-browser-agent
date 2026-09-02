@@ -1,15 +1,15 @@
-# Website Pet — a browser agent that learns site skills, and shows you what it's doing
+# Website Pet
 
-> **Built on [browser-use](https://github.com/browser-use/browser-use)** (MIT — Magnus Müller, Nick
-> Sweeting, Gregor Žunič and contributors). This repository is a full copy of browser-use with my
-> Website Pet layer added on top, because the pet needs changes to browser-use's own click and DOM
-> internals and will not run against the released package. Upstream's README is preserved as
-> [README.browser-use.md](./README.browser-use.md) and its licence is unchanged.
->
-> **My work is the `pet_*` modules, `pet_extension/`, `llm/openclaw/` and their tests** — listed
-> precisely under [What I built](#what-i-built).
+**A browser agent that learns reusable site skills — with a cat that walks to every element before
+it clicks, so you can watch it work.**
 
 ![The pet walking across a job application form to the submit button](docs/pet/cat-demo.gif)
+
+*Built on [browser-use](https://github.com/browser-use/browser-use) (MIT). My work is the `pet_*`
+modules, `pet_extension/` and `llm/openclaw/` — see [What I built](#what-i-built) and
+[Credits](#credits).*
+
+---
 
 A browser agent normally works invisibly: the tab twitches, things get clicked, and you find out
 what happened afterwards by reading a log. Two problems follow from that. You cannot supervise it,
@@ -158,6 +158,14 @@ $ curl -s "127.0.0.1:8765/status?session_id=tab:1"
 Running a full task additionally needs an LLM configured for `ChatOpenClaw`.
 
 ---
+
+## Why this repo contains all of browser-use
+
+The pet depends on changes to browser-use's own click and DOM internals, so it will not run against
+the released package. Rather than ship something that cannot be run, this repository is a full copy
+with my layer on top. Upstream's README is preserved as
+[README.browser-use.md](./README.browser-use.md) and its licence is unchanged; `git log` credits
+upstream for the other 9,288 commits.
 
 ## Credits
 
