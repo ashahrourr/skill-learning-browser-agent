@@ -17,6 +17,9 @@ from browser_use.observability import observe_debug
 # Serializer types
 DEFAULT_INCLUDE_ATTRIBUTES = [
 	'title',
+	# Bootstrap tooltips move title -> data-original-title on first hover, leaving icon-only buttons unlabeled
+	'data-original-title',
+	'data-bs-original-title',
 	'type',
 	'checked',
 	# 'class',

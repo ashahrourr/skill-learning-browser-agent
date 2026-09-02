@@ -552,6 +552,7 @@ class BrowserSession(BaseModel):
 
 	_cloud_browser_client: CloudBrowserClient = PrivateAttr(default_factory=lambda: CloudBrowserClient())
 	_demo_mode: 'DemoMode | None' = PrivateAttr(default=None)
+	_pet_overlay_script_identifier: str | None = PrivateAttr(default=None)
 
 	# WebSocket reconnection state
 	# Max wait = attempts * timeout_per_attempt + sum(delays) + small buffer
@@ -653,6 +654,7 @@ class BrowserSession(BaseModel):
 		if self._demo_mode:
 			self._demo_mode.reset()
 			self._demo_mode = None
+		self._pet_overlay_script_identifier = None
 
 		self._intentional_stop = False
 		self.logger.info('✅ Browser session reset complete')
@@ -1842,8 +1844,31 @@ class BrowserSession(BaseModel):
 			if redirect_tasks:
 				await asyncio.gather(*redirect_tasks, return_exceptions=True)
 
+			pet_initial_target_id = self.browser_profile.pet_initial_target_id
+			pet_origin_token = self.browser_profile.pet_origin_token
+			if self.browser_profile.pet_mode and pet_origin_token and not pet_initial_target_id:
+				marker_expression = (
+					'document.documentElement.getAttribute("data-browser-use-pet-origin-token")'
+				)
+				for candidate_target in page_targets_from_manager:
+					try:
+						candidate_session = await self.get_or_create_cdp_session(candidate_target.target_id, focus=False)
+						marker_result = await candidate_session.cdp_client.send.Runtime.evaluate(
+							params={'expression': marker_expression, 'returnByValue': True},
+							session_id=candidate_session.session_id,
+						)
+					except Exception:
+						continue
+					if marker_result.get('result', {}).get('value') == pet_origin_token:
+						pet_initial_target_id = candidate_target.target_id
+						self.logger.debug(f'🐾 Website Pet initial target found by token: {pet_initial_target_id[:8]}...')
+						break
+
 			# Ensure we have at least one page
-			if not page_targets_from_manager:
+			if pet_initial_target_id:
+				target_id = pet_initial_target_id
+				self.logger.debug(f'📄 Using Website Pet initial page: {target_id}')
+			elif not page_targets_from_manager:
 				new_target = await self._cdp_client_root.send.Target.createTarget(params={'url': 'about:blank'})
 				target_id = new_target['targetId']
 				self.logger.debug(f'📄 Created new blank page: {target_id}')
@@ -1883,9 +1908,10 @@ class BrowserSession(BaseModel):
 				self.event_bus.dispatch(TabCreatedEvent(url=target_url, target_id=target.target_id))
 
 			# Dispatch initial focus event
-			if page_targets_from_manager:
-				initial_url = page_targets_from_manager[0].url
-				self.event_bus.dispatch(AgentFocusChangedEvent(target_id=page_targets_from_manager[0].target_id, url=initial_url))
+			initial_target = self.session_manager.get_target(target_id) if self.session_manager else None
+			if initial_target:
+				initial_url = initial_target.url
+				self.event_bus.dispatch(AgentFocusChangedEvent(target_id=target_id, url=initial_url))
 				self.logger.debug(f'Initial agent focus set to tab 0: {initial_url}')
 
 		except Exception as e:
@@ -2810,7 +2836,7 @@ class BrowserSession(BaseModel):
 		Args:
 			node: The DOM node to highlight with backend_node_id for coordinate lookup
 		"""
-		if not self.browser_profile.highlight_elements:
+		if self.browser_profile.pet_mode or not self.browser_profile.highlight_elements:
 			return
 
 		try:
@@ -2949,7 +2975,7 @@ class BrowserSession(BaseModel):
 			x: Horizontal coordinate relative to viewport left edge
 			y: Vertical coordinate relative to viewport top edge
 		"""
-		if not self.browser_profile.highlight_elements:
+		if self.browser_profile.pet_mode or not self.browser_profile.highlight_elements:
 			return
 
 		try:
@@ -3047,6 +3073,314 @@ class BrowserSession(BaseModel):
 		except Exception as e:
 			# Don't fail the action if highlighting fails
 			self.logger.debug(f'Failed to highlight coordinate click: {e}')
+
+	async def preview_action_intent(self, action_name: str, params: dict[str, Any]) -> None:
+		"""Show a lightweight in-page preview of the next visible interaction.
+
+		The preview is intentionally best-effort and must never block the underlying
+		action from executing if the page, CDP session, or selector map changes.
+		"""
+		if not self.browser_profile.pet_mode:
+			return
+
+		try:
+			if action_name in {'click', 'input'}:
+				index = params.get('index')
+				if isinstance(index, int):
+					node = await self.get_element_by_index(index)
+					if node is None:
+						return
+
+					cdp_session = await self.get_or_create_cdp_session()
+					rect = await self.get_element_coordinates(node.backend_node_id, cdp_session)
+					if rect is None:
+						return
+
+					await self._show_pet_preview(
+						x=rect.x + rect.width / 2,
+						y=rect.y + rect.height / 2,
+						label=action_name,
+					)
+					return
+
+			if action_name == 'click':
+				coordinate_x = params.get('coordinate_x')
+				coordinate_y = params.get('coordinate_y')
+				if isinstance(coordinate_x, int) and isinstance(coordinate_y, int):
+					await self._show_pet_preview(x=coordinate_x, y=coordinate_y, label='click')
+					return
+		except Exception as e:
+			self.logger.debug(f'Failed to preview action intent: {e}')
+
+	async def ensure_pet_overlay(self) -> None:
+		"""Install the clickable pet prompt overlay in open tabs and future documents."""
+		if not self.browser_profile.pet_mode:
+			return
+
+		try:
+			script = self._get_pet_overlay_script()
+			if self._pet_overlay_script_identifier is None:
+				self._pet_overlay_script_identifier = await self._cdp_add_init_script(script)
+
+			for target in self.get_page_targets():
+				try:
+					cdp_session = await self.get_or_create_cdp_session(target.target_id, focus=False)
+					await cdp_session.cdp_client.send.Runtime.evaluate(
+						params={'expression': script, 'returnByValue': True}, session_id=cdp_session.session_id
+					)
+				except Exception as e:
+					self.logger.debug(f'Failed to install pet overlay in tab {target.target_id[-4:]}: {e}')
+		except Exception as e:
+			self.logger.debug(f'Failed to install pet overlay: {e}')
+
+	async def wait_for_pet_task(self, poll_interval: float = 0.4) -> str:
+		"""Wait until the user submits a task through the in-page pet prompt."""
+		if not self.browser_profile.pet_mode:
+			raise RuntimeError('pet_mode must be enabled before waiting for an in-page task')
+
+		while True:
+			await self.ensure_pet_overlay()
+			for target in self.get_page_targets():
+				try:
+					cdp_session = await self.get_or_create_cdp_session(target.target_id, focus=False)
+					result = await cdp_session.cdp_client.send.Runtime.evaluate(
+						params={
+							'expression': 'window.__browserUsePetTasks?.shift() || null',
+							'returnByValue': True,
+						},
+						session_id=cdp_session.session_id,
+					)
+					task = result.get('result', {}).get('value')
+					if isinstance(task, str) and task.strip():
+						switch_event = self.event_bus.dispatch(SwitchTabEvent(target_id=target.target_id))
+						await switch_event
+						await switch_event.event_result(raise_if_any=True, raise_if_none=False)
+						return task.strip()
+				except Exception as e:
+					self.logger.debug(f'Failed to poll pet task queue in tab {target.target_id[-4:]}: {e}')
+			await asyncio.sleep(poll_interval)
+
+	def _get_pet_overlay_script(self) -> str:
+		"""Return the self-contained in-page pet prompt overlay script."""
+		return """
+		(function() {
+			window.__browserUsePetTasks = window.__browserUsePetTasks || [];
+			if (document.getElementById('browser-use-pet-agent')) return { ok: true };
+
+			const size = 42;
+			const color = 'rgb(255, 127, 39)';
+			const pet = document.createElement('button');
+			pet.id = 'browser-use-pet-agent';
+			pet.type = 'button';
+			pet.setAttribute('data-browser-use-pet', 'true');
+			pet.setAttribute('aria-label', 'Open browser-use task prompt');
+			pet.title = 'Give the browser agent a task';
+			pet.textContent = ':)';
+			pet.style.cssText = `
+				position: fixed;
+				left: 24px;
+				top: 24px;
+				width: ${size}px;
+				height: ${size}px;
+				border: 0;
+				border-radius: 999px;
+				background: ${color};
+				box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
+				color: #111;
+				cursor: pointer;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				font: 700 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+				pointer-events: auto;
+				z-index: 2147483647;
+				transform: translate3d(0, 0, 0) scale(1);
+				transition: left 600ms cubic-bezier(.2,.8,.2,1), top 600ms cubic-bezier(.2,.8,.2,1), transform 160ms ease-out;
+			`;
+
+			const panel = document.createElement('form');
+			panel.id = 'browser-use-pet-agent-panel';
+			panel.setAttribute('data-browser-use-pet', 'true');
+			panel.style.cssText = `
+				position: fixed;
+				left: 24px;
+				top: 76px;
+				width: min(360px, calc(100vw - 48px));
+				padding: 10px;
+				border: 1px solid rgba(0, 0, 0, 0.12);
+				border-radius: 8px;
+				background: white;
+				box-shadow: 0 14px 34px rgba(0, 0, 0, 0.2);
+				display: none;
+				gap: 8px;
+				z-index: 2147483647;
+			`;
+
+			const input = document.createElement('input');
+			input.type = 'text';
+			input.placeholder = 'What should I do on this page?';
+			input.autocomplete = 'off';
+			input.style.cssText = `
+				box-sizing: border-box;
+				width: 100%;
+				padding: 9px 10px;
+				border: 1px solid #ccc;
+				border-radius: 6px;
+				color: #111;
+				background: white;
+				font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+			`;
+
+			const submit = document.createElement('button');
+			submit.type = 'submit';
+			submit.textContent = 'Run';
+			submit.style.cssText = `
+				border: 0;
+				border-radius: 6px;
+				padding: 0 12px;
+				background: ${color};
+				color: #111;
+				cursor: pointer;
+				font: 700 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+			`;
+
+			pet.addEventListener('click', () => {
+				panel.style.display = panel.style.display === 'flex' ? 'none' : 'flex';
+				if (panel.style.display === 'flex') input.focus();
+			});
+			panel.addEventListener('submit', (event) => {
+				event.preventDefault();
+				const task = input.value.trim();
+				if (!task) return;
+				window.__browserUsePetTasks.push(task);
+				input.value = '';
+				input.placeholder = 'Task started';
+				panel.style.display = 'none';
+			});
+
+			panel.append(input, submit);
+			document.documentElement.append(pet, panel);
+			return { ok: true };
+		})();
+		"""
+
+	def _convert_llm_coordinates_to_viewport(self, x: int, y: int) -> tuple[int, int]:
+		"""Convert model screenshot coordinates to viewport coordinates when screenshot resizing is active."""
+		if self.llm_screenshot_size and self._original_viewport_size:
+			original_width, original_height = self._original_viewport_size
+			llm_width, llm_height = self.llm_screenshot_size
+			return int((x / llm_width) * original_width), int((y / llm_height) * original_height)
+		return x, y
+
+	async def _show_pet_preview(self, x: float, y: float, label: str) -> None:
+		"""Move a glowing mouse cursor to a viewport coordinate before the action fires."""
+		duration_s = self.browser_profile.pet_preview_duration
+		if duration_s <= 0:
+			return
+
+		try:
+			import json
+
+			cdp_session = await self.get_or_create_cdp_session()
+			payload = {
+				'x': x,
+				'y': y,
+				'label': label,
+				'duration_ms': int(duration_s * 1000),
+				'color': self.browser_profile.interaction_highlight_color,
+			}
+			script = f"""
+			(function() {{
+				const payload = {json.dumps(payload)};
+				const size = 38;
+				const targetX = Math.max(8, Math.min(window.innerWidth - 8, payload.x));
+				const targetY = Math.max(8, Math.min(window.innerHeight - 8, payload.y));
+				const cursorColor = payload.label === 'input' ? '#4dd9ff' : '#ff7f27';
+
+				const companion = document.getElementById('browser-use-pet-companion');
+				if (companion) {{
+					document.documentElement.setAttribute('data-browser-use-pet-command', JSON.stringify({{
+						x: targetX,
+						y: targetY,
+						label: payload.label,
+						duration_ms: payload.duration_ms,
+					}}));
+					document.documentElement.dispatchEvent(new Event('browser-use-pet-command'));
+					return {{ ok: true, companion: true }};
+				}}
+
+				let cursor = document.getElementById('browser-use-intent-cursor');
+				if (!cursor) {{
+					cursor = document.createElement('div');
+					cursor.id = 'browser-use-intent-cursor';
+					cursor.setAttribute('data-browser-use-intent-cursor', 'true');
+					cursor.style.cssText = `
+						position: fixed;
+						left: 24px;
+						top: 24px;
+						width: ${{size}}px;
+						height: ${{size}}px;
+						pointer-events: none;
+						z-index: 2147483647;
+						transform: translate3d(0, 0, 0) scale(1);
+						transition: left ${{payload.duration_ms}}ms cubic-bezier(.2,.8,.2,1), top ${{payload.duration_ms}}ms cubic-bezier(.2,.8,.2,1), transform 160ms ease-out;
+					`;
+					cursor.innerHTML = `
+						<svg viewBox="0 0 38 38" width="38" height="38" aria-hidden="true">
+							<path d="M8 3.5L30.5 18.5L19.2 20.6L14.8 31.5L8 3.5Z"
+								fill="${{cursorColor}}" stroke="white" stroke-width="2.2" stroke-linejoin="round"/>
+						</svg>
+					`;
+					document.documentElement.appendChild(cursor);
+				}}
+
+				const path = cursor.querySelector('path');
+				if (path) path.setAttribute('fill', cursorColor);
+				cursor.style.filter = `drop-shadow(0 0 5px ${{cursorColor}}) drop-shadow(0 0 12px ${{cursorColor}})`;
+				cursor.style.transition = `left ${{payload.duration_ms}}ms cubic-bezier(.2,.8,.2,1), top ${{payload.duration_ms}}ms cubic-bezier(.2,.8,.2,1), transform 160ms ease-out`;
+				cursor.style.left = `${{targetX - size / 2}}px`;
+				cursor.style.top = `${{targetY - size / 2}}px`;
+				cursor.style.transform = 'translate3d(0, 0, 0) scale(1.2)';
+
+				let badge = document.getElementById('browser-use-pet-agent-badge');
+				if (!badge) {{
+					badge = document.createElement('div');
+					badge.id = 'browser-use-pet-agent-badge';
+					badge.setAttribute('data-browser-use-pet', 'true');
+					badge.style.cssText = `
+						position: fixed;
+						padding: 4px 7px;
+						border-radius: 999px;
+						background: rgba(17, 17, 17, 0.88);
+						color: white;
+						font: 600 11px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+						pointer-events: none;
+						z-index: 2147483647;
+						opacity: 0;
+						transition: opacity 120ms ease-out, left ${{payload.duration_ms}}ms cubic-bezier(.2,.8,.2,1), top ${{payload.duration_ms}}ms cubic-bezier(.2,.8,.2,1);
+					`;
+					document.documentElement.appendChild(badge);
+				}}
+				badge.textContent = payload.label;
+				badge.style.left = `${{targetX + 16}}px`;
+				badge.style.top = `${{targetY - 28}}px`;
+				badge.style.opacity = '1';
+
+				window.clearTimeout(window.__browserUsePetSettleTimer);
+				window.__browserUsePetSettleTimer = window.setTimeout(() => {{
+					cursor.style.transform = 'translate3d(0, 0, 0) scale(1)';
+					badge.style.opacity = '0';
+				}}, payload.duration_ms + 120);
+
+				return {{ ok: true }};
+			}})();
+			"""
+			await cdp_session.cdp_client.send.Runtime.evaluate(
+				params={'expression': script, 'returnByValue': True}, session_id=cdp_session.session_id
+			)
+			await asyncio.sleep(duration_s)
+		except Exception as e:
+			self.logger.debug(f'Failed to show pet preview: {e}')
 
 	async def add_highlights(self, selector_map: dict[int, 'EnhancedDOMTreeNode']) -> None:
 		"""Add visual highlights to the browser DOM for user visibility."""

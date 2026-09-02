@@ -1,4 +1,4 @@
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.json_schema import SkipJsonSchema
@@ -78,6 +78,60 @@ class ClickElementActionIndexOnly(BaseModel):
 	model_config = ConfigDict(title='ClickElementAction')
 
 	index: int = Field(ge=1, description='Element index from browser_state')
+
+
+class DragAction(BaseModel):
+	path: list[tuple[int, int]] = Field(
+		min_length=2,
+		description=(
+			'Ordered list of [x, y] viewport coordinates to drag the mouse through with the button held down. '
+			'The button presses at the first point and releases at the last. Provide enough points to trace the '
+			'intended shape (a straight line needs only start and end; a curve needs several).'
+		),
+	)
+	button: Literal['left', 'right', 'middle'] = Field(default='left', description='Mouse button to hold during the drag')
+
+
+class PlacePixelsAction(BaseModel):
+	cells: list[tuple[int, int]] = Field(
+		min_length=1,
+		description='Grid cells [x, y] to fill, in the canvas native pixel grid (NOT screen coords). Usually all the '
+		'cells of ONE color — select that color in the palette first, then call this with its cells.',
+	)
+	grid_width: int = Field(ge=1, description='Width of the pixel grid the cells refer to (e.g. the sprite width)')
+	grid_height: int = Field(ge=1, description='Height of the pixel grid the cells refer to (e.g. the sprite height)')
+	area: tuple[int, int, int, int] = Field(
+		description='On-screen rectangle [x, y, width, height] of the EDITABLE canvas to click on (the big editor '
+		"surface's screen box from read_canvas — NOT the thumbnail). The grid is mapped linearly across this rectangle.",
+	)
+	delay_ms: int = Field(
+		default=20,
+		ge=0,
+		le=1000,
+		description='Pause between each pen stroke (a stroke = one row-run of pixels) so the drawing is visibly painted '
+		'in. Higher = slower and more watchable; 0 = as fast as possible.',
+	)
+
+
+class ReadCanvasAction(BaseModel):
+	selector: str | None = Field(
+		default=None,
+		description=(
+			'CSS selector for the <canvas> to read. Leave empty on the first call: the result lists EVERY canvas on the '
+			"page (index, id, class, size, screen box, opaque-pixel count) under 'canvases' and reads nothing yet. Then "
+			'call again with a selector that matches exactly one canvas, OR with index= to pick from that list.'
+		),
+	)
+	index: int | None = Field(
+		default=None,
+		ge=0,
+		description="Pick a specific canvas by its index from the 'canvases' list returned by a previous read_canvas call.",
+	)
+	max_pixels: int = Field(
+		default=4096,
+		ge=1,
+		description='Safety cap on the number of opaque pixels returned, to avoid huge outputs on large canvases',
+	)
 
 
 class InputTextAction(BaseModel):

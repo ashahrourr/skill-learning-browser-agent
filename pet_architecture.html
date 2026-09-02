@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Website Pet — Architecture</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#171c24; --ink:#e7edf5; --mut:#9aa7b8;
+    --line:#2a3340; --accent:#e9894c; --accent2:#5ea9c9;
+    --green:#5fbf7f; --purple:#a98bdc; --amber:#e7b24c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 700px at 50% -10%,#18202b,var(--bg));
+    color:var(--ink);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    padding:34px 18px 60px}
+  h1{font-size:24px;margin:0 0 4px;text-align:center}
+  .sub{color:var(--mut);text-align:center;margin:0 0 28px}
+  .wrap{max-width:960px;margin:0 auto}
+  .flow{display:flex;flex-direction:column;align-items:center;gap:0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:16px 20px;width:100%;max-width:680px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+  .card h2{margin:0 0 6px;font-size:15px;display:flex;align-items:center;gap:8px}
+  .card p{margin:4px 0 0;color:var(--mut);font-size:13.5px}
+  .tag{font:600 11px ui-monospace,monospace;color:#0e1116;background:var(--accent);
+    border-radius:6px;padding:2px 7px}
+  .tag.b{background:var(--accent2)} .tag.g{background:var(--green)}
+  .tag.p{background:var(--purple)} .tag.a{background:var(--amber)}
+  .arrow{width:2px;height:26px;background:linear-gradient(var(--line),var(--accent));margin:6px 0}
+  .arrow::after{content:"▼";color:var(--accent);font-size:11px;position:relative;top:14px;left:-5px;display:block}
+  .lbl{color:var(--mut);font-size:12px;margin:2px 0}
+  code{font:600 12.5px ui-monospace,monospace;color:var(--accent2)}
+  .split{display:flex;gap:16px;width:100%;max-width:680px}
+  .split .card{max-width:none}
+  .learn{margin:40px auto 0;max-width:680px;background:var(--panel);border:1px solid var(--line);
+    border-radius:14px;overflow:hidden}
+  .learn h3{margin:0;padding:14px 20px;background:#1d2530;font-size:14px}
+  table{width:100%;border-collapse:collapse}
+  td,th{padding:11px 20px;text-align:left;border-top:1px solid var(--line);font-size:13.5px}
+  th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  .when{font:600 13px ui-monospace,monospace}
+  .free{color:var(--green);font-weight:700}
+  .model{margin:30px auto 0;max-width:680px;text-align:center;color:var(--mut);
+    border:1px dashed var(--line);border-radius:12px;padding:16px}
+  .model b{color:var(--accent)} .model .a2{color:var(--accent2)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🐱 Website Pet — Architecture</h1>
+  <p class="sub">Agent does it once → it learns → next time is free</p>
+
+  <div class="flow">
+
+    <div class="card" style="border-color:#3a4252">
+      <h2><span class="tag b">CHROME</span> The extension</h2>
+      <p>Cat on the page. You type a task in the bubble. <code>key-trap.js</code> stops your typing from leaking to the page. Sends task → <code>localhost:8765</code></p>
+    </div>
+
+    <div class="arrow"></div>
+    <div class="lbl">HTTP · task / reply / stop</div>
+
+    <div class="card">
+      <h2><span class="tag">BRIDGE</span> pet.py · one queue per tab</h2>
+      <p>1 · parse task (single or repeated-items)<br>
+         2 · snapshot a <b>BEFORE</b> image (the reference)<br>
+         3 · run the agent ↓</p>
+    </div>
+
+    <div class="arrow"></div>
+
+    <div class="card" style="border-color:var(--accent)">
+      <h2><span class="tag">AGENT</span> the "doer" — a rental</h2>
+      <p><code>openclaw LLM → browser-use → CDP/Chrome</code><br>
+         tools: click · type · send_keys · run_helper · <code>note</code> · run_site_skill</p>
+    </div>
+
+    <div class="arrow"></div>
+    <div class="lbl">while running, it uses ↘ and writes ↙</div>
+
+    <div class="split">
+      <div class="card" style="border-color:#3a4a3e">
+        <h2><span class="tag g">WORKFLOW</span> Skills</h2>
+        <p>Saved code. Replay = <b class="free">~200ms</b>, no LLM. The exact steps for a repeatable task.</p>
+      </div>
+      <div class="card" style="border-color:#4a3e52">
+        <h2><span class="tag p">STRATEGY</span> Notepad + Memory</h2>
+        <p>Live lessons this run (<code>note</code>: "don't swipe up"). Distilled to site memory at the end.</p>
+      </div>
+    </div>
+
+    <div class="arrow"></div>
+
+    <div class="card" style="border-color:var(--amber)">
+      <h2><span class="tag a">VERIFY</span> before vs after</h2>
+      <p>Compare result to the BEFORE reference. Not done? → <b>loop: fix → re-check</b> until it passes or gets stuck. (This is the gate that stops cheats from being saved.)</p>
+    </div>
+
+    <div class="arrow"></div>
+    <div class="lbl">if verified good</div>
+
+    <div class="card" style="border-color:#3a4a3e">
+      <h2><span class="tag g">CONSOLIDATE</span> learning</h2>
+      <p>• save working helper → <b style="color:var(--green)">SKILL</b> (workflow)<br>
+         • distill notepad/run → <b style="color:var(--purple)">MEMORY</b> (strategy)</p>
+    </div>
+
+  </div>
+
+  <div class="learn">
+    <h3>Three timescales of learning</h3>
+    <table>
+      <tr><th>When</th><th>What</th><th>Payoff</th></tr>
+      <tr><td class="when">During run</td><td>notepad (<code>note</code>)</td><td>smarter <i>this</i> game</td></tr>
+      <tr><td class="when">End of run</td><td>save skill + memory</td><td>smarter next time</td></tr>
+      <tr><td class="when">Next run</td><td>replay skill (no LLM)</td><td class="free">free + instant</td></tr>
+    </table>
+  </div>
+
+  <div class="model">
+    <b>Agent</b> = expensive teacher (used rarely).&nbsp;
+    <span class="a2">Skill</span> = free worker (used constantly).<br>
+    The bridge is the school that turns one into the other.
+  </div>
+</div>
+</body>
+</html>

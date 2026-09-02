@@ -156,6 +156,12 @@ Connection management lives in `browser_use/mcp/client.py`.
 - **Return `ActionResult` with structured content** to help agents reason better
 - **Run pre-commit hooks** before making PRs
 
+## gstack
+
+For all web browsing, use the `/browse` skill from gstack. **Never** use `mcp__claude-in-chrome__*` tools.
+
+Available gstack skills: /office-hours, /plan-ceo-review, /plan-eng-review, /plan-design-review, /design-consultation, /design-shotgun, /design-html, /review, /ship, /land-and-deploy, /canary, /benchmark, /browse, /connect-chrome, /qa, /qa-only, /design-review, /setup-browser-cookies, /setup-deploy, /setup-gbrain, /retro, /investigate, /document-release, /document-generate, /codex, /cso, /autoplan, /plan-devex-review, /devex-review, /careful, /freeze, /guard, /unfreeze, /gstack-upgrade, /learn.
+
 ## important-instruction-reminders
 Do what has been asked; nothing more, nothing less.
 NEVER create files unless they're absolutely necessary for achieving your goal.

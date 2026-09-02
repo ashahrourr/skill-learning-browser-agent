@@ -64,6 +64,7 @@ if TYPE_CHECKING:
 	from browser_use.llm.oci_raw.chat import ChatOCIRaw
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
+	from browser_use.llm.openclaw.chat import ChatOpenClaw
 	from browser_use.llm.vercel.chat import ChatVercel
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
@@ -89,6 +90,7 @@ _LAZY_IMPORTS = {
 	'DomService': ('browser_use.dom.service', 'DomService'),
 	# Chat models (very heavy imports)
 	'ChatOpenAI': ('browser_use.llm.openai.chat', 'ChatOpenAI'),
+	'ChatOpenClaw': ('browser_use.llm.openclaw.chat', 'ChatOpenClaw'),
 	'ChatGoogle': ('browser_use.llm.google.chat', 'ChatGoogle'),
 	'ChatAnthropic': ('browser_use.llm.anthropic.chat', 'ChatAnthropic'),
 	'ChatBrowserUse': ('browser_use.llm.browser_use.chat', 'ChatBrowserUse'),
@@ -141,6 +143,7 @@ __all__ = [
 	'AgentHistoryList',
 	# Chat models
 	'ChatOpenAI',
+	'ChatOpenClaw',
 	'ChatGoogle',
 	'ChatAnthropic',
 	'ChatBrowserUse',

@@ -377,6 +377,15 @@ class SessionManager:
 		target_type = event['targetInfo']['type']
 		target_info = event['targetInfo']
 		waiting_for_debugger = event.get('waitingForDebugger', False)
+		pet_initial_target_id = self.browser_session.browser_profile.pet_initial_target_id
+		if self.browser_session.browser_profile.pet_mode and self.browser_session.browser_profile.pet_origin_token:
+			pet_initial_target_id = pet_initial_target_id or self.browser_session.agent_focus_target_id
+			if pet_initial_target_id and target_type in {'page', 'tab'} and target_id != pet_initial_target_id:
+				self.logger.debug(
+					f'[SessionManager] Skipping non-origin Website Pet target {target_id[:8]}... '
+					f'(origin={pet_initial_target_id[:8]}...)'
+				)
+				return
 
 		self.logger.debug(
 			f'[SessionManager] Target attached: {target_id[:8]}... (session={session_id[:8]}..., '
@@ -762,6 +771,15 @@ class SessionManager:
 		# Get all existing targets
 		targets_result = await cdp_client.send.Target.getTargets()
 		existing_targets = targets_result.get('targetInfos', [])
+		pet_origin_token = self.browser_session.browser_profile.pet_origin_token
+		if self.browser_session.browser_profile.pet_mode and pet_origin_token:
+			pet_target_id = await self._find_pet_origin_target_id(existing_targets, pet_origin_token)
+			if pet_target_id:
+				self.browser_session.browser_profile.pet_initial_target_id = pet_target_id
+				existing_targets = [target for target in existing_targets if target['targetId'] == pet_target_id]
+				self.logger.debug(f'[SessionManager] Website Pet scoped startup to target {pet_target_id[:8]}...')
+			else:
+				self.logger.warning('[SessionManager] Website Pet origin token not found during scoped startup')
 
 		self.logger.debug(f'[SessionManager] Discovered {len(existing_targets)} existing targets')
 
@@ -842,6 +860,35 @@ class SessionManager:
 				await check_task
 			except asyncio.CancelledError:
 				pass
+
+	async def _find_pet_origin_target_id(self, targets: list[dict], origin_token: str) -> TargetID | None:
+		"""Find the existing page target that has the Website Pet one-time origin token."""
+		cdp_client = self.browser_session._cdp_client_root
+		assert cdp_client is not None
+		expression = 'document.documentElement.getAttribute("data-browser-use-pet-origin-token")'
+		for target in targets:
+			target_id = target['targetId']
+			if target.get('type') not in {'page', 'tab'}:
+				continue
+			session_id = None
+			try:
+				attach_result = await cdp_client.send.Target.attachToTarget(params={'targetId': target_id, 'flatten': True})
+				session_id = attach_result.get('sessionId')
+				result = await cdp_client.send.Runtime.evaluate(
+					params={'expression': expression, 'returnByValue': True},
+					session_id=session_id,
+				)
+			except Exception:
+				continue
+			finally:
+				if session_id:
+					try:
+						await cdp_client.send.Target.detachFromTarget(params={'sessionId': session_id})
+					except Exception:
+						pass
+			if result.get('result', {}).get('value') == origin_token:
+				return target_id
+		return None
 
 	async def _enable_page_monitoring(self, cdp_session: 'CDPSession') -> None:
 		"""Enable lifecycle events and network monitoring for a page target.

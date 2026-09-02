@@ -264,6 +264,36 @@ class TestDOMSerializer:
 
 		print('\n🎉 DOM Serializer test completed successfully!')
 
+	async def test_bootstrap_tooltip_stripped_title_is_still_labeled(self, browser_session, http_server, base_url):
+		"""Icon-only buttons whose title was moved to data-original-title (Bootstrap tooltip fixTitle) must keep a label.
+
+		Bootstrap tooltips strip the title attribute on first hover and stash it in
+		data-original-title (data-bs-original-title in Bootstrap 5). Piskel's Save/Export/Import
+		buttons hit this: after a hover they serialized as bare <div /> and the LLM had to guess.
+		"""
+		html = """
+		<html><body>
+			<div data-setting="import" rel="tooltip" onclick="void(0)" style="width:24px;height:24px;cursor:pointer"
+				data-original-title="&lt;span class='highlight'&gt;IMPORT&lt;/span&gt;&lt;/br&gt;Import an existing image"></div>
+			<div data-setting="export" rel="tooltip" onclick="void(0)" style="width:24px;height:24px;cursor:pointer"
+				data-bs-original-title="EXPORT - Export as Image"></div>
+			<div data-setting="resize" rel="tooltip" onclick="void(0)" style="width:24px;height:24px;cursor:pointer"
+				title="RESIZE - Resize the drawing area"></div>
+		</body></html>
+		"""
+		http_server.expect_request('/tooltip-stripped').respond_with_data(html, content_type='text/html')
+
+		await browser_session.navigate_to(f'{base_url}/tooltip-stripped')
+		browser_state_summary = await browser_session.get_browser_state_summary(
+			include_screenshot=False,
+			include_recent_events=False,
+		)
+		serialized_text = browser_state_summary.dom_state.llm_representation()
+
+		assert 'IMPORT' in serialized_text, f'data-original-title label missing from serialized DOM:\n{serialized_text}'
+		assert 'EXPORT' in serialized_text, f'data-bs-original-title label missing from serialized DOM:\n{serialized_text}'
+		assert 'RESIZE' in serialized_text, f'plain title label missing from serialized DOM:\n{serialized_text}'
+
 	async def test_dom_serializer_element_counts_detailed(self, browser_session, base_url):
 		"""Detailed test to verify specific element types are captured correctly."""
 

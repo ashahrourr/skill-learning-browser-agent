@@ -144,6 +144,21 @@ class ClickCoordinateEvent(BaseEvent[dict]):
 	event_timeout: float | None = Field(default_factory=lambda: _get_timeout('TIMEOUT_ClickCoordinateEvent', 15.0))  # seconds
 
 
+class DragCoordinateEvent(BaseEvent[dict]):
+	"""Drag the mouse along a path of viewport coordinates while holding the button down.
+
+	The path is a list of (x, y) points: the button presses at the first point, moves
+	through every intermediate point with the button held, and releases at the last point.
+	Use for freehand strokes on a <canvas>, sliders, and drag-and-drop.
+	"""
+
+	path: list[tuple[int, int]]
+	button: Literal['left', 'right', 'middle'] = 'left'
+	steps_between: int = 8  # interpolated mouseMoved events inserted between each pair of path points
+
+	event_timeout: float | None = Field(default_factory=lambda: _get_timeout('TIMEOUT_DragCoordinateEvent', 30.0))  # seconds
+
+
 class TypeTextEvent(ElementSelectedEvent[dict | None]):
 	"""Type text into an element."""
 

@@ -107,6 +107,38 @@ class TestCoordinateClickingTools:
 		assert schema['title'] == 'ClickElementAction'
 
 
+class TestDragAction:
+	"""The drag action is registered in lockstep with coordinate clicking."""
+
+	def test_drag_absent_by_default(self):
+		tools = Tools()
+		assert 'drag' not in tools.registry.registry.actions
+
+	def test_drag_registered_when_coordinates_enabled(self):
+		tools = Tools()
+		tools.set_coordinate_clicking(True)
+		drag_action = tools.registry.registry.actions.get('drag')
+		assert drag_action is not None
+		schema = drag_action.param_model.model_json_schema()
+		assert 'path' in schema['properties']
+
+	def test_drag_removed_when_coordinates_disabled(self):
+		tools = Tools()
+		tools.set_coordinate_clicking(True)
+		tools.set_coordinate_clicking(False)
+		assert 'drag' not in tools.registry.registry.actions
+
+	def test_drag_path_requires_two_points(self):
+		from pydantic import ValidationError
+
+		from browser_use.tools.views import DragAction
+
+		with pytest.raises(ValidationError):
+			DragAction(path=[(1, 1)])
+		# two points is the minimum valid drag
+		assert len(DragAction(path=[(1, 1), (2, 2)]).path) == 2
+
+
 class TestCoordinateClickingModelDetection:
 	"""Test the model detection logic for coordinate clicking."""
 

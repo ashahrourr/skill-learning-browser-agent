@@ -169,6 +169,7 @@ include = [
     "!browser_use/**/tests/*.py",
     "!browser_use/**/tests.py",
 	"browser_use/agent/system_prompts/*.md",
+	"browser_use/pet_prompts/*.md",
     "browser_use/cli_templates/*.py",
     "browser_use/py.typed",
     "browser_use/dom/**/*.js",

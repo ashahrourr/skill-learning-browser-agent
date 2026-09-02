@@ -646,6 +646,18 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		default=False,
 		description='Enable demo mode side panel that streams agent logs directly inside the browser window (requires headless=False).',
 	)
+	pet_mode: bool = Field(
+		default=False,
+		description='Show a lightweight in-page intent preview before the agent performs visible interactions.',
+	)
+	pet_initial_target_id: str | None = Field(
+		default=None,
+		description='Internal Website Pet target id to use as initial focus without selecting the first Chrome tab.',
+	)
+	pet_origin_token: str | None = Field(
+		default=None,
+		description='Internal Website Pet DOM marker token used to choose the originating tab as initial focus.',
+	)
 	cookie_whitelist_domains: list[str] = Field(
 		default_factory=lambda: ['nature.com', 'qatarairways.com'],
 		description='List of domains to whitelist in the "I still don\'t care about cookies" extension, preventing automatic cookie banner handling on these sites.',
@@ -696,6 +708,11 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		description='Color to use for highlighting elements during interactions (CSS color string).',
 	)
 	interaction_highlight_duration: float = Field(default=1.0, description='Duration in seconds to show interaction highlights.')
+	pet_preview_duration: float = Field(
+		default=1.9,
+		ge=0,
+		description='Seconds to pause while the pet intent preview moves to the next interaction target.',
+	)
 
 	# --- Downloads ---
 	auto_download_pdfs: bool = Field(default=True, description='Automatically download PDFs when navigating to PDF viewer pages.')

@@ -19,6 +19,7 @@ from browser_use.browser.events import (
 	ClickCoordinateEvent,
 	ClickElementEvent,
 	CloseTabEvent,
+	DragCoordinateEvent,
 	GetDropdownOptionsEvent,
 	GoBackEvent,
 	NavigateToUrlEvent,
@@ -42,12 +43,15 @@ from browser_use.tools.views import (
 	ClickElementActionIndexOnly,
 	CloseTabAction,
 	DoneAction,
+	DragAction,
 	ExtractAction,
 	FindElementsAction,
 	GetDropdownOptionsAction,
 	InputTextAction,
 	NavigateAction,
 	NoParamsAction,
+	PlacePixelsAction,
+	ReadCanvasAction,
 	SaveAsPdfAction,
 	ScreenshotAction,
 	ScrollAction,
@@ -87,6 +91,8 @@ T = TypeVar('T', bound=BaseModel)
 # slow-but-valid LLM-backed actions aren't truncated. Override per-call via
 # BROWSER_USE_ACTION_TIMEOUT_S env var or tools.act(action_timeout=...).
 _ACTION_TIMEOUT_FALLBACK_S = 180.0
+# Upper bound on cells painted by a single place_pixels call, to keep one action bounded in time.
+_MAX_PIXELS_PER_PLACE = 1500
 
 
 def _parse_env_action_timeout(raw: str | None) -> float:
@@ -428,6 +434,7 @@ class Tools(Generic[Context]):
 		self.display_files_in_done_text = display_files_in_done_text
 		self._output_model: type[BaseModel] | None = output_model
 		self._coordinate_clicking_enabled: bool = False
+		self.action_timeout_overrides: dict[str, float] = {}
 
 		"""Register all default browser actions"""
 
@@ -676,6 +683,28 @@ class Tools(Generic[Context]):
 				error_msg = f'Failed to click at coordinates ({params.coordinate_x}, {params.coordinate_y}).'
 				return ActionResult(error=error_msg)
 
+		async def _drag_by_coordinates(params: DragAction, browser_session: BrowserSession) -> ActionResult:
+			try:
+				# Convert each path point from LLM-screenshot space to actual viewport space.
+				viewport_path = [
+					_convert_llm_coordinates_to_viewport(x, y, browser_session) for x, y in params.path
+				]
+
+				event = browser_session.event_bus.dispatch(DragCoordinateEvent(path=viewport_path, button=params.button))
+				await event
+				await event.event_result(raise_if_any=True, raise_if_none=False)
+
+				memory = f'Dragged from {params.path[0]} to {params.path[-1]} through {len(params.path)} points'
+				logger.info(f'🖱️ {memory}')
+				return ActionResult(
+					extracted_content=memory,
+					metadata={'drag_start': list(viewport_path[0]), 'drag_end': list(viewport_path[-1])},
+				)
+			except BrowserError as e:
+				return handle_browser_error(e)
+			except Exception:
+				return ActionResult(error=f'Failed to drag from {params.path[0]} to {params.path[-1]}.')
+
 		async def _click_by_index(
 			params: ClickElementAction | ClickElementActionIndexOnly, browser_session: BrowserSession
 		) -> ActionResult:
@@ -742,12 +771,13 @@ class Tools(Generic[Context]):
 		# Store click handlers for re-registration
 		self._click_by_index = _click_by_index
 		self._click_by_coordinate = _click_by_coordinate
+		self._drag_by_coordinates = _drag_by_coordinates
 
 		# Register click action (index-only by default)
 		self._register_click_action()
 
 		@self.registry.action(
-			'Input text into element by index. Clears existing text by default; pass text="" to clear only, or clear=False to append.',
+			'Input text into element by index. Clears existing text by default; pass text="" to clear only, or clear=False to append. This only types/focuses the field; if results must load, commit separately with Enter, a suggestion, or a visible Search/Apply/Update button.',
 			param_model=InputTextAction,
 		)
 		async def input(
@@ -1449,7 +1479,9 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				return ActionResult(error=error_msg)
 
 		@self.registry.action(
-			'',
+			'Press keyboard keys or shortcuts on the page — e.g. a single key (Enter, Escape, Tab), '
+			'an arrow key (ArrowUp/ArrowDown/ArrowLeft/ArrowRight), or a combo (ctrl+a, cmd+c). '
+			'Use this for key-driven UIs and games (arrow keys, WASD) where there is no element to click.',
 			param_model=SendKeysAction,
 		)
 		async def send_keys(params: SendKeysAction, browser_session: BrowserSession):
@@ -1880,6 +1912,169 @@ Validated Code (after quote fixing):
 				logger.debug(f'JavaScript code that failed: {code[:200]}...')
 				return ActionResult(error=error_msg)
 
+		@self.registry.action(
+			"Inspect/read <canvas> pixels. FIRST call it with no selector/index: it returns 'canvases', the list of "
+			'EVERY canvas on the page (index, id, class, intrinsic size, on-screen box, opaque-pixel count) and reads no '
+			'pixels — pages often stack several (small per-frame thumbnails, a big grid-rendered editor view, overlays). '
+			'Inspect that list and pick the one you want (e.g. a clean small thumbnail of the target frame, not a big '
+			'grid view). THEN call again with index=N (from the list) or a selector matching exactly one canvas: it '
+			'returns that canvas\'s intrinsic size and opaque pixels as [x, y] grouped by "#rrggbb", in native pixel-grid '
+			"coords. Map a pixel (x, y) to a screen point via the canvas's screen box and intrinsic size.",
+			param_model=ReadCanvasAction,
+		)
+		async def read_canvas(params: ReadCanvasAction, browser_session: BrowserSession):
+			cdp_session = await browser_session.get_or_create_cdp_session()
+			# List every canvas so the model can choose. Only read full pixels when exactly one canvas is pinned
+			# (by index from a prior listing, or a selector that matches a single canvas) — otherwise hand back the list.
+			sel_js = json.dumps(params.selector) if params.selector is not None else 'null'
+			idx_js = str(params.index) if params.index is not None else 'null'
+			js = (
+				'(function(){try{'
+				'var all=Array.from(document.querySelectorAll("canvas"));'
+				'function stat(c){var r=c.getBoundingClientRect();var w=c.width,h=c.height;var op=null;'
+				'try{var x=c.getContext("2d");if(x){var d=x.getImageData(0,0,w,h).data;var k=0;'
+				'for(var i=3;i<d.length;i+=4){if(d[i]!==0)k++;}op=k;}}catch(e){op="unreadable";}'
+				'return {id:c.id||"",cls:c.className||"",width:w,height:h,'
+				'screen:{x:Math.round(r.left),y:Math.round(r.top),width:Math.round(r.width),height:Math.round(r.height)},'
+				'opaque_pixels:op};}'
+				'var canvases=all.map(function(c,i){var s=stat(c);s.index=i;return s;});'
+				f'var idx={idx_js};var sel={sel_js};var chosen=null;'
+				'if(idx!==null){if(idx<0||idx>=all.length)return JSON.stringify({error:"index out of range",canvases:canvases});chosen=all[idx];}'
+				'else if(sel!==null){var m=Array.from(document.querySelectorAll(sel)).filter(function(c){return c.tagName.toLowerCase()==="canvas";});'
+				'if(m.length===0)return JSON.stringify({error:"no canvas matches selector",canvases:canvases});'
+				'if(m.length>1)return JSON.stringify({needs_selection:true,matched:m.length,canvases:canvases});'
+				'chosen=m[0];}'
+				'else{return JSON.stringify({needs_selection:true,canvases:canvases});}'
+				'var ci=all.indexOf(chosen);var w=chosen.width,h=chosen.height;var ctx=chosen.getContext("2d");'
+				'if(!ctx)return JSON.stringify({error:"could not get 2d context",canvases:canvases});'
+				'var d=ctx.getImageData(0,0,w,h).data;var groups={};var n=0;var capped=false;'
+				f'var cap={params.max_pixels};'
+				'for(var y=0;y<h;y++){for(var x=0;x<w;x++){var i=(y*w+x)*4;if(d[i+3]===0)continue;'
+				'if(n>=cap){capped=true;break;}'
+				'var hex="#"+((1<<24)+(d[i]<<16)+(d[i+1]<<8)+d[i+2]).toString(16).slice(1);'
+				'(groups[hex]=groups[hex]||[]).push([x,y]);n++;}if(capped)break;}'
+				'var r=chosen.getBoundingClientRect();'
+				'return JSON.stringify({chosen_index:ci,width:w,height:h,'
+				'screen:{x:Math.round(r.left),y:Math.round(r.top),width:Math.round(r.width),height:Math.round(r.height)},'
+				'opaque_pixels:n,capped:capped,colors:groups,canvases:canvases});'
+				"}catch(e){return JSON.stringify({error:''+e});}})()"
+			)
+			try:
+				result = await cdp_session.cdp_client.send.Runtime.evaluate(
+					params={'expression': js, 'returnByValue': True, 'awaitPromise': True},
+					session_id=cdp_session.session_id,
+				)
+				if result.get('exceptionDetails'):
+					return ActionResult(error=f'read_canvas failed: {result["exceptionDetails"].get("text", "unknown error")}')
+				raw = result.get('result', {}).get('value')
+				if not raw:
+					return ActionResult(error='read_canvas returned no data (canvas may be tainted or empty)')
+				data = json.loads(raw)
+				if 'error' in data:
+					hint = ' Available canvases: ' + json.dumps(data['canvases']) if data.get('canvases') else ''
+					return ActionResult(error=f'read_canvas: {data["error"]}.{hint}')
+
+				canvas_list = data.get('canvases', [])
+
+				# Listing mode: no single canvas pinned yet — hand back the list for the model to choose from.
+				if data.get('needs_selection'):
+					def _desc(c: dict) -> str:
+						label = c.get('id') or c.get('cls') or 'canvas'
+						return f'#{c["index"]} {label} {c["width"]}x{c["height"]} ({c["opaque_pixels"]} px)'
+
+					listing = '; '.join(_desc(c) for c in canvas_list)
+					extra = f' ({data["matched"]} matched your selector)' if data.get('matched') else ''
+					summary = (
+						f'{len(canvas_list)} canvases on page{extra}. Pick one and call read_canvas again with index=N '
+						f'(or a selector matching exactly one): {listing}'
+					)
+					logger.info(f'🎨 read_canvas: listed {len(canvas_list)} canvases (awaiting selection)')
+					return ActionResult(extracted_content=raw, long_term_memory=summary, include_extracted_content_only_once=True)
+
+				summary = (
+					f'Read canvas #{data["chosen_index"]}: {data["width"]}x{data["height"]} drawing grid at screen '
+					f'({data["screen"]["x"]},{data["screen"]["y"]}) size {data["screen"]["width"]}x{data["screen"]["height"]}, '
+					f'{data["opaque_pixels"]} opaque pixels in {len(data["colors"])} colors'
+					+ (' (capped — raise max_pixels for the full image)' if data.get('capped') else '')
+					+ f'. Pixel coords are in the {data["width"]}x{data["height"]} grid.'
+				)
+				logger.info(
+					f'🎨 read_canvas: chose #{data["chosen_index"]} ({data["width"]}x{data["height"]}), {data["opaque_pixels"]} px'
+				)
+				return ActionResult(extracted_content=raw, long_term_memory=summary, include_extracted_content_only_once=True)
+			except Exception as e:
+				return ActionResult(error=f'Failed to read canvas: {type(e).__name__}: {e}')
+
+		@self.registry.action(
+			'Paint a batch of pixels onto a canvas so the drawing visibly fills in (not all at once). Give the grid '
+			'cells of a single color (after selecting that color/the pen), the grid size, and the editable canvas\'s '
+			'on-screen rectangle (its "screen" box from read_canvas). Adjacent cells in a row are drawn as one quick '
+			'pen stroke, so a sprite paints in as fast sweeps rather than slow dot-by-dot. Call once per color to '
+			'reproduce a sprite the way a person would: fill one color, then the next.',
+			param_model=PlacePixelsAction,
+		)
+		async def place_pixels(params: PlacePixelsAction, browser_session: BrowserSession):
+			if len(params.cells) > _MAX_PIXELS_PER_PLACE:
+				return ActionResult(
+					error=f'Too many cells ({len(params.cells)}) — cap is {_MAX_PIXELS_PER_PLACE} per call. Split the color into multiple calls.'
+				)
+			area_x, area_y, area_w, area_h = params.area
+			if area_w <= 0 or area_h <= 0:
+				return ActionResult(error='area width/height must be positive (use the canvas screen box from read_canvas)')
+
+			def _to_screen(grid_x: int, grid_y: int) -> tuple[int, int]:
+				return (
+					int(area_x + (grid_x + 0.5) * area_w / params.grid_width),
+					int(area_y + (grid_y + 0.5) * area_h / params.grid_height),
+				)
+
+			# Coalesce cells into contiguous horizontal runs per row: a row of N same-color pixels becomes one pen
+			# stroke instead of N clicks. Draw top-to-bottom, left-to-right so it paints in like a person would.
+			rows: dict[int, list[int]] = {}
+			for grid_x, grid_y in params.cells:
+				rows.setdefault(grid_y, []).append(grid_x)
+			runs: list[tuple[int, int, int]] = []  # (row_y, x_start, x_end)
+			for row_y, xs in rows.items():
+				ordered = sorted(set(xs))
+				start = prev = ordered[0]
+				for x in ordered[1:]:
+					if x == prev + 1:
+						prev = x
+					else:
+						runs.append((row_y, start, prev))
+						start = prev = x
+				runs.append((row_y, start, prev))
+			runs.sort(key=lambda r: (r[0], r[1]))
+
+			# Raw CDP mouse events (no event-bus, no per-click safety sleeps) keep this fast. Coordinates are already
+			# real viewport CSS pixels (from the canvas screen box), so no LLM-screenshot scaling is applied.
+			cdp_session = await browser_session.get_or_create_cdp_session()
+			client = cdp_session.cdp_client
+			sid = cdp_session.session_id
+			placed = 0
+			for row_y, x_start, x_end in runs:
+				points = [_to_screen(x, row_y) for x in range(x_start, x_end + 1)]
+				sx, sy = points[0]
+				await client.send.Input.dispatchMouseEvent(params={'type': 'mouseMoved', 'x': sx, 'y': sy}, session_id=sid)
+				await client.send.Input.dispatchMouseEvent(
+					params={'type': 'mousePressed', 'x': sx, 'y': sy, 'button': 'left', 'clickCount': 1}, session_id=sid
+				)
+				for px, py in points[1:]:
+					await client.send.Input.dispatchMouseEvent(
+						params={'type': 'mouseMoved', 'x': px, 'y': py, 'button': 'left'}, session_id=sid
+					)
+				ex, ey = points[-1]
+				await client.send.Input.dispatchMouseEvent(
+					params={'type': 'mouseReleased', 'x': ex, 'y': ey, 'button': 'left', 'clickCount': 1}, session_id=sid
+				)
+				placed += len(points)
+				if params.delay_ms:
+					await asyncio.sleep(params.delay_ms / 1000)
+
+			memory = f'Painted {placed} pixels in {len(runs)} strokes onto the {params.grid_width}x{params.grid_height} grid'
+			logger.info(f'🖌️ place_pixels: {placed} pixels in {len(runs)} strokes')
+			return ActionResult(extracted_content=memory + '.', long_term_memory=memory + '.')
+
 	def _validate_and_fix_javascript(self, code: str) -> str:
 		"""Validate and fix common JavaScript issues before execution"""
 
@@ -2063,7 +2258,21 @@ Validated Code (after quote fixing):
 		if 'click' in self.registry.registry.actions:
 			del self.registry.registry.actions['click']
 
+		# The drag action only exists alongside coordinate clicking; rebuild it in lockstep.
+		if 'drag' in self.registry.registry.actions:
+			del self.registry.registry.actions['drag']
+
 		if self._coordinate_clicking_enabled:
+
+			@self.registry.action(
+				'Drag the mouse through a path of viewport coordinates with the button held down (press at the first '
+				'point, release at the last). Use for freehand strokes on a <canvas> (drawing/signatures), moving '
+				'sliders, or drag-and-drop. For a single point use click instead.',
+				param_model=DragAction,
+			)
+			async def drag(params: DragAction, browser_session: BrowserSession):
+				return await self._drag_by_coordinates(params, browser_session)
+
 			# Register click action WITH coordinate support
 			@self.registry.action(
 				'Click element by index or coordinates. Use coordinates only if the index is not available. Either provide coordinates or index.',
@@ -2134,10 +2343,9 @@ Validated Code (after quote fixing):
 		page_extraction_llm cap used by the `extract` action).
 		"""
 
-		timeout_s = _coerce_valid_action_timeout(action_timeout)
-
 		for action_name, params in action.model_dump(exclude_unset=True).items():
 			if params is not None:
+				timeout_s = _coerce_valid_action_timeout(self.action_timeout_overrides.get(action_name, action_timeout))
 				# Use Laminar span if available, otherwise use no-op context manager
 				if Laminar is not None:
 					span_context = Laminar.start_as_current_span(

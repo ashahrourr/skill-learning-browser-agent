@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 	from browser_use.llm.oci_raw.chat import ChatOCIRaw
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
+	from browser_use.llm.openclaw.chat import ChatOpenClaw
 	from browser_use.llm.openrouter.chat import ChatOpenRouter
 	from browser_use.llm.vercel.chat import ChatVercel
 
@@ -92,6 +93,7 @@ _LAZY_IMPORTS = {
 	'ChatOCIRaw': ('browser_use.llm.oci_raw.chat', 'ChatOCIRaw'),
 	'ChatOllama': ('browser_use.llm.ollama.chat', 'ChatOllama'),
 	'ChatOpenAI': ('browser_use.llm.openai.chat', 'ChatOpenAI'),
+	'ChatOpenClaw': ('browser_use.llm.openclaw.chat', 'ChatOpenClaw'),
 	'ChatOpenRouter': ('browser_use.llm.openrouter.chat', 'ChatOpenRouter'),
 	'ChatVercel': ('browser_use.llm.vercel.chat', 'ChatVercel'),
 }
@@ -144,6 +146,7 @@ __all__ = [
 	# Chat models
 	'BaseChatModel',
 	'ChatOpenAI',
+	'ChatOpenClaw',
 	'ChatBrowserUse',
 	'ChatDeepSeek',
 	'ChatGoogle',

@@ -97,6 +97,14 @@ class DOMTreeSerializer:
 		except (ValueError, TypeError):
 			return None
 
+	def _is_browser_use_overlay_node(self, node: EnhancedDOMTreeNode) -> bool:
+		"""Exclude Browser Use's own in-page overlays from agent DOM context."""
+		attrs = node.attributes or {}
+		element_id = attrs.get('id', '')
+		if element_id.startswith('browser-use-'):
+			return True
+		return attrs.get('data-browser-use-pet') == 'true' or attrs.get('data-browser-use-intent-cursor') == 'true'
+
 	def serialize_accessible_elements(self) -> tuple[SerializedDOMState, dict[str, float]]:
 		import time
 
@@ -466,6 +474,9 @@ class DOMTreeSerializer:
 				return None
 
 			attributes = node.attributes or {}
+			if self._is_browser_use_overlay_node(node):
+				return None
+
 			# Check for session-specific exclude attribute first, then fall back to legacy attribute
 			exclude_attr = None
 			attr_type = None
@@ -509,6 +520,22 @@ class DOMTreeSerializer:
 			)
 			if not is_visible and is_file_input:
 				is_visible = True  # Force visibility for file inputs
+
+			# EXCEPTION: Checkbox/radio inputs are often visually hidden (opacity:0, position:absolute
+			# with 1px size, clip-path, etc.) while a custom-styled sibling is shown instead.
+			# The native input is still the functional target — expose it so the LLM can click it
+			# directly rather than clicking an adjacent label/span that may have no click handler.
+			# Only include if the element is actually interactive (not aria-hidden or disabled).
+			is_hidden_checkbox = (
+				not is_visible
+				and node.tag_name
+				and node.tag_name.lower() == 'input'
+				and node.attributes
+				and node.attributes.get('type', '').lower() in ('checkbox', 'radio')
+				and self._is_interactive_cached(node)
+			)
+			if is_hidden_checkbox:
+				is_visible = True
 
 			# Include if visible, scrollable, has children, or is shadow host
 			if is_visible or is_scrollable or has_shadow_content or is_shadow_host:
@@ -564,12 +591,23 @@ class DOMTreeSerializer:
 			and node.original_node.attributes.get('type') == 'file'
 		)
 
+		# EXCEPTION: Same as above for checkbox/radio inputs — keep them even if not visible
+		is_hidden_checkbox = (
+			not is_visible
+			and node.original_node.tag_name
+			and node.original_node.tag_name.lower() == 'input'
+			and node.original_node.attributes
+			and node.original_node.attributes.get('type', '').lower() in ('checkbox', 'radio')
+			and self._is_interactive_cached(node.original_node)
+		)
+
 		if (
 			is_visible  # Keep all visible nodes
 			or node.original_node.is_actually_scrollable
 			or node.original_node.node_type == NodeType.TEXT_NODE
 			or node.children
 			or is_file_input  # Keep file inputs even if not visible
+			or is_hidden_checkbox  # Keep hidden checkboxes/radios that are functional
 		):
 			return node
 
@@ -703,6 +741,16 @@ class DOMTreeSerializer:
 						should_make_interactive = True
 			elif is_interactive_assign and (is_visible or is_file_input or is_shadow_dom_element):
 				# Non-scrollable interactive elements: make interactive if visible (or file input or shadow DOM form element)
+				should_make_interactive = True
+			elif is_interactive_assign and (
+				node.original_node.tag_name
+				and node.original_node.tag_name.lower() == 'input'
+				and node.original_node.attributes
+				and node.original_node.attributes.get('type', '').lower() in ('checkbox', 'radio')
+			):
+				# EXCEPTION: Hidden checkbox/radio inputs — always make interactive so the LLM
+				# can click the native input directly instead of an adjacent label/span.
+				# The click handler uses JS .click() fallback for hidden/occluded elements.
 				should_make_interactive = True
 
 			# Add to selector map if element should be interactive
@@ -933,6 +981,19 @@ class DOMTreeSerializer:
 				# Don't process children for SVG
 				return '\n'.join(formatted_text)
 
+			# Collect inline text from direct text node children
+			inline_text_parts = []
+			remaining_children = []
+			for child in node.children:
+				if child.original_node.node_type == NodeType.TEXT_NODE:
+					val = child.original_node.node_value
+					if val and val.strip() and len(val.strip()) > 1:
+						inline_text_parts.append(val.strip())
+				else:
+					remaining_children.append(child)
+
+			inline_text = ' '.join(inline_text_parts) if inline_text_parts else ''
+
 			# Add element if clickable, scrollable, or iframe
 			is_any_scrollable = node.original_node.is_actually_scrollable or node.original_node.is_scrollable
 			should_show_scroll = node.original_node.should_show_scroll_info
@@ -945,9 +1006,8 @@ class DOMTreeSerializer:
 				next_depth += 1
 
 				# Build attributes string with compound component info
-				text_content = ''
 				attributes_html_str = DOMTreeSerializer._build_attributes_string(
-					node.original_node, include_attributes, text_content
+					node.original_node, include_attributes, inline_text
 				)
 
 				# Add compound component information to attributes if present
@@ -1017,7 +1077,10 @@ class DOMTreeSerializer:
 				if attributes_html_str:
 					line += f' {attributes_html_str}'
 
-				line += ' />'
+				if inline_text:
+					line += f'>{inline_text}</{node.original_node.tag_name}>'
+				else:
+					line += ' />'
 
 				# Add scroll information only when we should show it
 				if should_show_scroll:
@@ -1059,28 +1122,33 @@ class DOMTreeSerializer:
 				formatted_text.append(f'{depth_str}{clean_text}')
 
 		# Process children (for non-shadow elements)
-		if node.original_node.node_type != NodeType.DOCUMENT_FRAGMENT_NODE:
+		if node.original_node.node_type == NodeType.ELEMENT_NODE:
+			for child in remaining_children:
+				child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, next_depth)
+				if child_text:
+					formatted_text.append(child_text)
+		elif node.original_node.node_type != NodeType.DOCUMENT_FRAGMENT_NODE:
 			for child in node.children:
 				child_text = DOMTreeSerializer.serialize_tree(child, include_attributes, next_depth)
 				if child_text:
 					formatted_text.append(child_text)
 
-			# Add hidden content hint for iframes
-			if (
-				node.original_node.node_type == NodeType.ELEMENT_NODE
-				and node.original_node.tag_name
-				and node.original_node.tag_name.upper() in ('IFRAME', 'FRAME')
-			):
-				if node.original_node.hidden_elements_info:
-					# Show specific interactive elements with scroll distances
-					hidden = node.original_node.hidden_elements_info
-					hint_lines = [f'{depth_str}... ({len(hidden)} more elements below - scroll to reveal):']
-					for elem in hidden:
-						hint_lines.append(f'{depth_str}    <{elem["tag"]}> "{elem["text"]}" ~{elem["pages"]} pages down')
-					formatted_text.extend(hint_lines)
-				elif node.original_node.has_hidden_content:
-					# Generic hint for non-interactive hidden content
-					formatted_text.append(f'{depth_str}... (more content below viewport - scroll to reveal)')
+		# Add hidden content hint for iframes
+		if (
+			node.original_node.node_type == NodeType.ELEMENT_NODE
+			and node.original_node.tag_name
+			and node.original_node.tag_name.upper() in ('IFRAME', 'FRAME')
+		):
+			if node.original_node.hidden_elements_info:
+				# Show specific interactive elements with scroll distances
+				hidden = node.original_node.hidden_elements_info
+				hint_lines = [f'{depth_str}... ({len(hidden)} more elements below - scroll to reveal):']
+				for elem in hidden:
+					hint_lines.append(f'{depth_str}    <{elem["tag"]}> "{elem["text"]}" ~{elem["pages"]} pages down')
+				formatted_text.extend(hint_lines)
+			elif node.original_node.has_hidden_content:
+				# Generic hint for non-interactive hidden content
+				formatted_text.append(f'{depth_str}... (more content below viewport - scroll to reveal)')
 
 		return '\n'.join(formatted_text)
 

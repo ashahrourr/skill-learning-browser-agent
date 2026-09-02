@@ -21,6 +21,8 @@ venv/
 dist/
 
 # Data files
+.pet_logs/
+.pet_sites/
 *.gif
 *.txt
 *.pdf
@@ -84,3 +86,4 @@ product_extraction.py
 plot.py
 
 .claude/
+.gstack/

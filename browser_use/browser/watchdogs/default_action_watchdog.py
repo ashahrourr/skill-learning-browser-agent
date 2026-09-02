@@ -5,11 +5,13 @@ import json
 import os
 
 from cdp_use.cdp.input.commands import DispatchKeyEventParameters
+from cdp_use.cdp.input.types import MouseButton
 
 from browser_use.actor.utils import get_key_info
 from browser_use.browser.events import (
 	ClickCoordinateEvent,
 	ClickElementEvent,
+	DragCoordinateEvent,
 	GetDropdownOptionsEvent,
 	GoBackEvent,
 	GoForwardEvent,
@@ -40,6 +42,25 @@ UploadFileEvent.model_rebuild()
 
 class DefaultActionWatchdog(BaseWatchdog):
 	"""Handles default browser actions like click, type, and scroll using CDP."""
+
+	async def _preview_node_action_intent(self, action_name: str, element_node: EnhancedDOMTreeNode) -> None:
+		"""In pet mode, move the visible pet to an element before mutating the page."""
+		if not self.browser_session.browser_profile.pet_mode:
+			return
+		if not element_node.backend_node_id:
+			return
+		try:
+			cdp_session = await self.browser_session.cdp_client_for_node(element_node)
+			rect = await self.browser_session.get_element_coordinates(element_node.backend_node_id, cdp_session)
+			if rect is None:
+				return
+			await self.browser_session._show_pet_preview(
+				x=rect.x + rect.width / 2,
+				y=rect.y + rect.height / 2,
+				label=action_name,
+			)
+		except Exception as e:
+			self.logger.debug(f'Failed to preview pet {action_name} intent: {e}')
 
 	async def _execute_click_with_download_detection(
 		self,
@@ -448,6 +469,16 @@ class DefaultActionWatchdog(BaseWatchdog):
 		except Exception:
 			raise
 
+	async def on_DragCoordinateEvent(self, event: DragCoordinateEvent) -> dict:
+		"""Handle a press-move-release drag along a path of viewport coordinates using CDP."""
+		if not self.browser_session.agent_focus_target_id:
+			error_msg = 'Cannot execute drag: browser session is corrupted (target_id=None). Session may have crashed.'
+			self.logger.error(error_msg)
+			raise BrowserError(error_msg)
+		if len(event.path) < 2:
+			raise BrowserError('Drag path must contain at least 2 points (start and end).')
+		return await self._drag_on_path(event.path, button=event.button, steps_between=event.steps_between)
+
 	async def on_TypeTextEvent(self, event: TypeTextEvent) -> dict | None:
 		"""Handle text input request with CDP."""
 		try:
@@ -696,8 +727,8 @@ class DefaultActionWatchdog(BaseWatchdog):
 				return True
 
 		except Exception as e:
-			self.logger.debug(f'Occlusion check failed: {e}, assuming not occluded')
-			return False
+			self.logger.debug(f'Occlusion check failed: {e}, assuming occluded (safe default)')
+			return True
 
 	async def _click_element_node_impl(self, element_node) -> dict | None:
 		"""
@@ -762,12 +793,29 @@ class DefaultActionWatchdog(BaseWatchdog):
 			viewport_width = layout_metrics['layoutViewport']['clientWidth']
 			viewport_height = layout_metrics['layoutViewport']['clientHeight']
 
-			# Scroll element into view FIRST before getting coordinates
+			# Scroll element into view FIRST before getting coordinates.
+			# Use JS scrollIntoView with behavior:'instant' so ALL scroll ancestors (including
+			# horizontally-scrollable filter bars like LinkedIn's) move synchronously before
+			# we query coordinates. DOM.scrollIntoViewIfNeeded only scrolls the nearest ancestor
+			# and doesn't guarantee instant completion for CSS smooth-scroll containers.
 			try:
-				await cdp_session.cdp_client.send.DOM.scrollIntoViewIfNeeded(
+				scroll_result = await cdp_session.cdp_client.send.DOM.resolveNode(
 					params={'backendNodeId': backend_node_id}, session_id=session_id
 				)
-				await asyncio.sleep(0.05)  # Wait for scroll to complete
+				scroll_object_id = scroll_result.get('object', {}).get('objectId')
+				if scroll_object_id:
+					await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+						params={
+							'functionDeclaration': "function() { this.scrollIntoView({behavior:'instant', block:'nearest', inline:'nearest'}); }",
+							'objectId': scroll_object_id,
+						},
+						session_id=session_id,
+					)
+				else:
+					await cdp_session.cdp_client.send.DOM.scrollIntoViewIfNeeded(
+						params={'backendNodeId': backend_node_id}, session_id=session_id
+					)
+				await asyncio.sleep(0.05)
 				self.logger.debug('Scrolled element into view before getting coordinates')
 			except Exception as e:
 				self.logger.debug(f'Failed to scroll element into view: {e}')
@@ -808,6 +856,8 @@ class DefaultActionWatchdog(BaseWatchdog):
 						'Failed to find DOM element based on backendNodeId, maybe page content changed?'
 					)
 					object_id = result['object']['objectId']
+
+					await self._preview_pet_at_live_rect(object_id, cdp_session, viewport_width, viewport_height)
 
 					await cdp_session.cdp_client.send.Runtime.callFunctionOn(
 						params={
@@ -867,6 +917,39 @@ class DefaultActionWatchdog(BaseWatchdog):
 			center_x = sum(best_quad[i] for i in range(0, 8, 2)) / 4
 			center_y = sum(best_quad[i] for i in range(1, 8, 2)) / 4
 
+			# If the element center is outside the viewport, the scroll didn't bring it into view
+			# (e.g. element is clipped by an overflow:hidden ancestor that we couldn't scroll).
+			# Clamping the coordinates would land the click on a completely different element —
+			# use JS click directly instead.
+			if center_x < 0 or center_x >= viewport_width or center_y < 0 or center_y >= viewport_height:
+				self.logger.debug(
+					f'Element center ({center_x:.0f}, {center_y:.0f}) is outside viewport '
+					f'({viewport_width}x{viewport_height}), using JavaScript click to avoid misfiring'
+				)
+				try:
+					result = await cdp_session.cdp_client.send.DOM.resolveNode(
+						params={'backendNodeId': backend_node_id}, session_id=session_id
+					)
+					assert 'object' in result and 'objectId' in result['object'], (
+						'Failed to find DOM element based on backendNodeId'
+					)
+					object_id = result['object']['objectId']
+
+					await self._preview_pet_at_live_rect(object_id, cdp_session, viewport_width, viewport_height)
+					js_fn = (
+						'function() { this.click(); this.dispatchEvent(new Event("change", {bubbles:true})); this.dispatchEvent(new Event("input", {bubbles:true})); }'
+						if is_toggle_element
+						else 'function() { this.click(); }'
+					)
+					await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+						params={'functionDeclaration': js_fn, 'objectId': object_id},
+						session_id=session_id,
+					)
+					await asyncio.sleep(0.05)
+					return None
+				except Exception as js_e:
+					raise Exception(f'Element off-screen and JavaScript click failed: {js_e}')
+
 			# Ensure click point is within viewport bounds
 			center_x = max(0, min(viewport_width - 1, center_x))
 			center_y = max(0, min(viewport_height - 1, center_y))
@@ -885,12 +968,17 @@ class DefaultActionWatchdog(BaseWatchdog):
 						'Failed to find DOM element based on backendNodeId'
 					)
 					object_id = result['object']['objectId']
+					await self._preview_pet_at_live_rect(object_id, cdp_session, viewport_width, viewport_height)
 
+					# For radio/checkbox: also dispatch change+input events so React/Vue
+					# synthetic event handlers fire — element.click() alone bypasses them.
+					js_fn = (
+						'function() { this.click(); this.dispatchEvent(new Event("change", {bubbles:true})); this.dispatchEvent(new Event("input", {bubbles:true})); }'
+						if is_toggle_element
+						else 'function() { this.click(); }'
+					)
 					await cdp_session.cdp_client.send.Runtime.callFunctionOn(
-						params={
-							'functionDeclaration': 'function() { this.click(); }',
-							'objectId': object_id,
-						},
+						params={'functionDeclaration': js_fn, 'objectId': object_id},
 						session_id=session_id,
 					)
 					await asyncio.sleep(0.05)
@@ -901,6 +989,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 			# Perform the click using CDP (element is not occluded)
 			try:
+				await self.browser_session._show_pet_preview(x=center_x, y=center_y, label='click')
 				self.logger.debug(f'👆 Dragging mouse over element before clicking x: {center_x}px y: {center_y}px ...')
 				# Move mouse to element
 				await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
@@ -1059,6 +1148,41 @@ class DefaultActionWatchdog(BaseWatchdog):
 				long_term_memory=error_detail,
 			)
 
+	async def _preview_pet_at_live_rect(
+		self, object_id: str, cdp_session, viewport_width: float, viewport_height: float
+	) -> bool:
+		"""Walk the pet to the element's live bounding rect center.
+
+		Stored geometry is often bogus for shadow DOM elements (0,0 or negative), so JS
+		fallback click paths must ask the live element where it really renders. Returns
+		True if the preview was shown at a valid on-screen point.
+		"""
+		try:
+			rect_res = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+				params={
+					'functionDeclaration': 'function() { const r = this.getBoundingClientRect(); return {x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height}; }',
+					'objectId': object_id,
+					'returnByValue': True,
+				},
+				session_id=cdp_session.session_id,
+			)
+			point = rect_res.get('result', {}).get('value') or {}
+			px, py = point.get('x'), point.get('y')
+			pw, ph = point.get('w', 0), point.get('h', 0)
+			if (
+				isinstance(px, (int, float))
+				and isinstance(py, (int, float))
+				and pw > 0
+				and ph > 0
+				and 0 <= px < viewport_width
+				and 0 <= py < viewport_height
+			):
+				await self.browser_session._show_pet_preview(x=px, y=py, label='click')
+				return True
+		except Exception:
+			pass
+		return False
+
 	async def _click_on_coordinate(self, coordinate_x: int, coordinate_y: int, force: bool = False) -> dict | None:
 		"""
 		Click directly at coordinates using CDP Input.dispatchMouseEvent.
@@ -1075,6 +1199,11 @@ class DefaultActionWatchdog(BaseWatchdog):
 			# Get CDP session
 			cdp_session = await self.browser_session.get_or_create_cdp_session()
 			session_id = cdp_session.session_id
+
+			await self.browser_session.preview_action_intent(
+				'click',
+				{'coordinate_x': int(coordinate_x), 'coordinate_y': int(coordinate_y)},
+			)
 
 			self.logger.debug(f'👆 Moving mouse to ({coordinate_x}, {coordinate_y})...')
 
@@ -1137,6 +1266,61 @@ class DefaultActionWatchdog(BaseWatchdog):
 			raise BrowserError(
 				message=f'Failed to click at coordinates: {e}',
 				long_term_memory=f'Failed to click at coordinates ({coordinate_x}, {coordinate_y}). The coordinates may be outside viewport or the page may have changed.',
+			)
+
+	async def _drag_on_path(self, path: list[tuple[int, int]], button: MouseButton = 'left', steps_between: int = 8) -> dict:
+		"""Drag the mouse through ``path`` with the button held: press at path[0], move through the rest, release at path[-1].
+
+		Intermediate ``mouseMoved`` events are interpolated between each pair of points so canvases that draw on
+		pointermove (e.g. pixel editors) register a continuous stroke rather than two disconnected dots.
+		"""
+		assert len(path) >= 2, 'drag path must have at least 2 points'
+		try:
+			cdp_session = await self.browser_session.get_or_create_cdp_session()
+			session_id = cdp_session.session_id
+
+			start_x, start_y = path[0]
+			await self.browser_session.preview_action_intent('drag', {'start': path[0], 'end': path[-1]})
+
+			# Move to the start, then press.
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={'type': 'mouseMoved', 'x': start_x, 'y': start_y}, session_id=session_id
+			)
+			await asyncio.sleep(0.02)
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={'type': 'mousePressed', 'x': start_x, 'y': start_y, 'button': button, 'clickCount': 1},
+				session_id=session_id,
+			)
+			await asyncio.sleep(0.02)
+
+			# Walk the path with the button held, interpolating intermediate moves for a smooth stroke.
+			prev_x, prev_y = start_x, start_y
+			for next_x, next_y in path[1:]:
+				segments = max(1, steps_between)
+				for step in range(1, segments + 1):
+					interp_x = round(prev_x + (next_x - prev_x) * step / segments)
+					interp_y = round(prev_y + (next_y - prev_y) * step / segments)
+					await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+						params={'type': 'mouseMoved', 'x': interp_x, 'y': interp_y, 'button': button},
+						session_id=session_id,
+					)
+					await asyncio.sleep(0.01)
+				prev_x, prev_y = next_x, next_y
+
+			# Release at the final point.
+			end_x, end_y = path[-1]
+			await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+				params={'type': 'mouseReleased', 'x': end_x, 'y': end_y, 'button': button, 'clickCount': 1},
+				session_id=session_id,
+			)
+			self.logger.debug(f'🖱️ Dragged from {path[0]} to {path[-1]} through {len(path)} points')
+			return {'drag_start': list(path[0]), 'drag_end': list(path[-1]), 'points': len(path)}
+
+		except Exception as e:
+			self.logger.error(f'Failed to drag along path {path[0]}..{path[-1]}: {type(e).__name__}: {e}')
+			raise BrowserError(
+				message=f'Failed to drag along coordinates: {e}',
+				long_term_memory=f'Failed to drag from {path[0]} to {path[-1]}. Coordinates may be outside the viewport.',
 			)
 
 	async def _type_to_page(self, text: str):
@@ -1539,29 +1723,31 @@ class DefaultActionWatchdog(BaseWatchdog):
 	async def _focus_element_simple(
 		self, backend_node_id: int, object_id: str, cdp_session, input_coordinates: dict | None = None
 	) -> bool:
-		"""Simple focus strategy: CDP first, then click if failed."""
+		"""Focus an element before typing.
 
-		# Strategy 1: Try CDP DOM.focus first
-		try:
-			result = await cdp_session.cdp_client.send.DOM.focus(
-				params={'backendNodeId': backend_node_id},
-				session_id=cdp_session.session_id,
-			)
-			self.logger.debug(f'Element focused using CDP DOM.focus (result: {result})')
-			return True
+		Website Pet uses click-to-focus first so the visible action matches how a human
+		would interact with the page. Regular browser-use keeps the historical CDP focus
+		first path for compatibility.
+		"""
 
-		except Exception as e:
-			self.logger.debug(f'❌ CDP DOM.focus threw exception: {type(e).__name__}: {e}')
-
-		# Strategy 2: Try click to focus if CDP failed
-		if input_coordinates and 'input_x' in input_coordinates and 'input_y' in input_coordinates:
+		async def click_to_focus() -> bool:
+			if not input_coordinates or 'input_x' not in input_coordinates or 'input_y' not in input_coordinates:
+				return False
 			try:
 				click_x = input_coordinates['input_x']
 				click_y = input_coordinates['input_y']
 
 				self.logger.debug(f'🎯 Attempting click-to-focus at ({click_x:.1f}, {click_y:.1f})')
 
-				# Click to focus
+				await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
+					params={
+						'type': 'mouseMoved',
+						'x': click_x,
+						'y': click_y,
+					},
+					session_id=cdp_session.session_id,
+				)
+				await asyncio.sleep(0.03)
 				await cdp_session.cdp_client.send.Input.dispatchMouseEvent(
 					params={
 						'type': 'mousePressed',
@@ -1588,6 +1774,31 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 			except Exception as e:
 				self.logger.debug(f'Click focus failed: {e}')
+				return False
+
+		async def dom_focus() -> bool:
+			try:
+				result = await cdp_session.cdp_client.send.DOM.focus(
+					params={'backendNodeId': backend_node_id},
+					session_id=cdp_session.session_id,
+				)
+				self.logger.debug(f'Element focused using CDP DOM.focus (result: {result})')
+				return True
+
+			except Exception as e:
+				self.logger.debug(f'❌ CDP DOM.focus threw exception: {type(e).__name__}: {e}')
+				return False
+
+		if self.browser_session.browser_profile.pet_mode:
+			if await click_to_focus():
+				return True
+			if await dom_focus():
+				return True
+		else:
+			if await dom_focus():
+				return True
+			if await click_to_focus():
+				return True
 
 		# Both strategies failed
 		self.logger.debug('Focus strategies failed, will attempt typing anyway')
@@ -1807,6 +2018,13 @@ class DefaultActionWatchdog(BaseWatchdog):
 			if not object_id:
 				raise ValueError('Could not get object_id for element')
 
+			if input_coordinates and 'input_x' in input_coordinates and 'input_y' in input_coordinates:
+				await self.browser_session._show_pet_preview(
+					x=input_coordinates['input_x'],
+					y=input_coordinates['input_y'],
+					label='input',
+				)
+
 			# Step 1: Focus the element using simple strategy
 			focused_successfully = await self._focus_element_simple(
 				backend_node_id=backend_node_id, object_id=object_id, cdp_session=cdp_session, input_coordinates=input_coordinates
@@ -1839,16 +2057,6 @@ class DefaultActionWatchdog(BaseWatchdog):
 				self.logger.debug('🎯 Typing <sensitive> character by character')
 			else:
 				self.logger.debug(f'🎯 Typing text character by character: "{text}"')
-
-			# Detect contenteditable elements (may have leaf-start bug where first char is dropped)
-			_attrs = element_node.attributes or {}
-			_is_contenteditable = _attrs.get('contenteditable') in ('true', '') or (
-				_attrs.get('role') == 'textbox' and element_node.tag_name not in ('input', 'textarea')
-			)
-
-			# For contenteditable: after typing first char, check if dropped and retype if needed
-			_check_first_char = _is_contenteditable and len(text) > 0 and clear
-			_first_char = text[0] if _check_first_char else None
 
 			for i, char in enumerate(text):
 				# Handle newline characters as Enter key
@@ -1931,44 +2139,6 @@ class DefaultActionWatchdog(BaseWatchdog):
 						},
 						session_id=cdp_session.session_id,
 					)
-
-				# After first char on contenteditable: check if dropped and retype if needed
-				if i == 0 and _check_first_char and _first_char:
-					check_result = await cdp_session.cdp_client.send.Runtime.evaluate(
-						params={'expression': 'document.activeElement.textContent'},
-						session_id=cdp_session.session_id,
-					)
-					content = check_result.get('result', {}).get('value', '')
-					if _first_char not in content:
-						self.logger.debug(f'🎯 First char "{_first_char}" was dropped (leaf-start bug), retyping')
-						# Retype the first character - cursor now past leaf-start
-						modifiers, vk_code, base_key = self._get_char_modifiers_and_vk(_first_char)
-						key_code = self._get_key_code_for_char(base_key)
-						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-							params={
-								'type': 'keyDown',
-								'key': base_key,
-								'code': key_code,
-								'modifiers': modifiers,
-								'windowsVirtualKeyCode': vk_code,
-							},
-							session_id=cdp_session.session_id,
-						)
-						await asyncio.sleep(0.005)
-						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-							params={'type': 'char', 'text': _first_char, 'key': _first_char},
-							session_id=cdp_session.session_id,
-						)
-						await cdp_session.cdp_client.send.Input.dispatchKeyEvent(
-							params={
-								'type': 'keyUp',
-								'key': base_key,
-								'code': key_code,
-								'modifiers': modifiers,
-								'windowsVirtualKeyCode': vk_code,
-							},
-							session_id=cdp_session.session_id,
-						)
 
 				# Small delay between characters to look human (realistic typing speed)
 				await asyncio.sleep(0.001)
@@ -2205,14 +2375,14 @@ class DefaultActionWatchdog(BaseWatchdog):
 			# (opposite of mouseWheel deltaY convention)
 			y_distance = -pixels
 
-			# Synthesize scroll gesture - use very high speed for near-instant scrolling
+			# Use a moderate speed so scrolling remains readable and resembles a deliberate human gesture.
 			await cdp_client.send.Input.synthesizeScrollGesture(
 				params={
 					'x': center_x,
 					'y': center_y,
 					'xDistance': 0,
 					'yDistance': y_distance,
-					'speed': 50000,  # pixels per second (high = near-instant scroll)
+					'speed': 1200,  # pixels per second
 				},
 				session_id=session_id,
 			)
@@ -2280,15 +2450,79 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 					if scroll_result and 'result' in scroll_result and 'value' in scroll_result['result']:
 						result_value = scroll_result['result']['value']
-						if result_value.get('success'):
+						if result_value.get('success') and abs(result_value.get('scrolled', 0)) > 0:
 							self.logger.debug(f'Successfully scrolled iframe content by {result_value.get("scrolled", 0)}px')
 							return True
 						else:
 							self.logger.debug(f'Failed to scroll iframe: {result_value.get("error", "Unknown error")}')
 
-			# For non-iframe elements, use the standard mouse wheel approach
-			# Get element bounds to know where to scroll
 			backend_node_id = element_node.backend_node_id
+
+			# Prefer direct DOM scrolling for nested scroll containers such as dialogs and modals.
+			# A wheel event can be swallowed by the wrong ancestor while still appearing successful.
+			result = await cdp_session.cdp_client.send.DOM.resolveNode(
+				params={'backendNodeId': backend_node_id},
+				session_id=cdp_session.session_id,
+			)
+			if 'object' in result and 'objectId' in result['object']:
+				scroll_result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+					params={
+						'functionDeclaration': """
+							function(pixels) {
+								const canScroll = (el) => {
+									if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+									const style = getComputedStyle(el);
+									const overflowY = style.overflowY || style.overflow || '';
+									const allowsScroll = /auto|scroll|overlay/i.test(overflowY);
+									return allowsScroll && el.scrollHeight > el.clientHeight + 1;
+								};
+								const canMove = (el) => {
+									const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+									return pixels > 0 ? el.scrollTop < maxScrollTop : el.scrollTop > 0;
+								};
+								const scrollBy = (el) => {
+									const before = el.scrollTop;
+									const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+									el.scrollTop = Math.max(0, Math.min(maxScrollTop, before + pixels));
+									return {
+										tag: el.tagName,
+										before,
+										after: el.scrollTop,
+										scrolled: el.scrollTop - before,
+									};
+								};
+
+								let current = this;
+								while (current) {
+									if (canScroll(current) && canMove(current)) return scrollBy(current);
+									if (current.parentElement) {
+										current = current.parentElement;
+									} else {
+										const root = current.getRootNode && current.getRootNode();
+										current = root && root.host ? root.host : null;
+									}
+								}
+
+								const documentScroller = document.scrollingElement || document.documentElement || document.body;
+								if (canMove(documentScroller)) return scrollBy(documentScroller);
+								return {scrolled: 0, error: 'No scrollable ancestor could move'};
+							}
+						""",
+						'objectId': result['object']['objectId'],
+						'arguments': [{'value': pixels}],
+						'returnByValue': True,
+					},
+					session_id=cdp_session.session_id,
+				)
+				result_value = scroll_result.get('result', {}).get('value') if scroll_result else None
+				if isinstance(result_value, dict) and abs(result_value.get('scrolled', 0)) > 0:
+					self.logger.debug(
+						f'Successfully scrolled {result_value.get("tag", "element")} by {result_value.get("scrolled", 0)}px'
+					)
+					return True
+				self.logger.debug(f'Direct element scroll did not move: {result_value}')
+
+			# Fall back to a wheel event at the element location.
 			box_model = await cdp_session.cdp_client.send.DOM.getBoxModel(
 				params={'backendNodeId': backend_node_id}, session_id=cdp_session.session_id
 			)
@@ -3252,6 +3486,7 @@ class DefaultActionWatchdog(BaseWatchdog):
 			element_node = event.node
 			index_for_logging = element_node.backend_node_id or 'unknown'
 			target_text = event.text
+			await self._preview_node_action_intent('select', element_node)
 
 			# Get CDP session for this node
 			cdp_session = await self.browser_session.cdp_client_for_node(element_node)
