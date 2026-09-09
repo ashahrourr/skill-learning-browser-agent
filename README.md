@@ -3,12 +3,13 @@
 **A browser agent that learns reusable site skills — with a cat that walks to every element before
 it clicks, so you can watch it work.**
 
-![The pet running across a job application form and stopping at the submit button](docs/pet/cat-demo.gif)
+![The pet filling in a job application form field by field and submitting it](docs/pet/cat-demo.gif)
 
-<sub>Captured from the running extension at 30fps (`MediaRecorder` on the companion's own WebGL
-canvas), composited over the page at the positions the animation actually reported. The task panel
-is hidden here so the walk reads clearly — it is shown in
-[the panel screenshot below](#the-task-panel).</sub>
+<sub>A real screen recording of the extension working an empty job application: you type a task, the
+prompt box gives way to **Stop**, and the cat walks to each field, fills it, ticks consent and
+submits. Highlights from a 33s run — [full clip](docs/pet/cat-demo.mp4). **The model's replies are
+scripted here**, because no LLM is configured in this environment; everything else — the cat, the
+panel, the typing, the clicks — is the extension running for real.</sub>
 
 *Built on [browser-use](https://github.com/browser-use/browser-use) (MIT). My work is the `pet_*`
 modules, `pet_extension/` and `llm/openclaw/` — see [What I built](#what-i-built) and
@@ -34,11 +35,12 @@ Website Pet addresses both:
 
 <a id="the-task-panel"></a>
 
-![The cat with its task panel open, asking what to do on this page](docs/pet/cat-at-target.jpg)
+![The panel reading "Filling portfolio" while the cat stands at the field it is typing into](docs/pet/cat-at-target.jpg)
 
-Click the cat and it opens a panel anchored to wherever it is standing: type a task, press Run.
-While a task is running the panel shows live status, surfaces the agent's questions, and offers a
-stop button.
+Click the cat and a panel opens anchored to wherever it is standing: type a task, press Run. While a
+task is active the task box is replaced by **Stop** and the panel narrates each step — above, it is
+part-way through the form, standing at the field it is filling. It also surfaces the agent's
+questions and takes your reply inline.
 
 ---
 
