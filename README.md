@@ -5,10 +5,6 @@ before it touches it.**
 
 ![The pet filling in a job application form field by field and submitting it](docs/pet/cat-demo.gif)
 
-<sub>Real recording. The model's replies are scripted here (no LLM configured in this environment);
-the cat, the panel, the typing and the clicks are the extension running for real.
-[Full clip](docs/pet/cat-demo.mp4).</sub>
-
 ---
 
 ## The problem
@@ -73,7 +69,7 @@ python -m browser_use.pet  # bridge on 127.0.0.1:8765
 Load `browser_use/pet_extension/` at `chrome://extensions` → Developer mode → **Load unpacked**.
 Open any page, click the extension icon to deploy the pet there, then click the cat and type a task.
 
-<sub>Built on [browser-use](https://github.com/browser-use/browser-use) (MIT) — kept as a full copy
-because the pet depends on the internals above and will not run against the released package.
-Upstream's README is [here](./README.browser-use.md); extension detail is in
-[`pet_extension/README.md`](browser_use/pet_extension/README.md).</sub>
+Running real tasks needs an LLM configured for `ChatOpenClaw`. The demo above was recorded with
+scripted model replies, so the recording shows the pet layer rather than a live agent.
+
+<sub>Built on [browser-use](https://github.com/browser-use/browser-use) (MIT).</sub>
