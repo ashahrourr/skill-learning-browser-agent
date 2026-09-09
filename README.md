@@ -7,7 +7,7 @@ it clicks, so you can watch it work.**
 
 <sub>A real screen recording of the extension working an empty job application: you type a task, the
 prompt box gives way to **Stop**, and the cat walks to each field, fills it, ticks consent and
-submits. Highlights from a 33s run — [full clip](docs/pet/cat-demo.mp4). **The model's replies are
+submits. The full run, uncut — [same thing as MP4](docs/pet/cat-demo.mp4). **The model's replies are
 scripted here**, because no LLM is configured in this environment; everything else — the cat, the
 panel, the typing, the clicks — is the extension running for real.</sub>
 
