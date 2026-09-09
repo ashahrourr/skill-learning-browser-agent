@@ -1,196 +1,79 @@
 # Website Pet
 
-**A browser agent that learns reusable site skills — with a cat that walks to every element before
-it clicks, so you can watch it work.**
+**A browser agent that learns a site once, then replays it — with a cat that walks to every element
+before it touches it.**
 
 ![The pet filling in a job application form field by field and submitting it](docs/pet/cat-demo.gif)
 
-<sub>A real screen recording of the extension working an empty job application: you type a task, the
-prompt box gives way to **Stop**, and the cat walks to each field, fills it, ticks consent and
-submits. The full run, uncut — [same thing as MP4](docs/pet/cat-demo.mp4). **The model's replies are
-scripted here**, because no LLM is configured in this environment; everything else — the cat, the
-panel, the typing, the clicks — is the extension running for real.</sub>
-
-*Built on [browser-use](https://github.com/browser-use/browser-use) (MIT). My work is the `pet_*`
-modules, `pet_extension/` and `llm/openclaw/` — see [What I built](#what-i-built) and
-[Credits](#credits).*
+<sub>Real recording. The model's replies are scripted here (no LLM configured in this environment);
+the cat, the panel, the typing and the clicks are the extension running for real.
+[Full clip](docs/pet/cat-demo.mp4).</sub>
 
 ---
 
-A browser agent normally works invisibly: the tab twitches, things get clicked, and you find out
-what happened afterwards by reading a log. Two problems follow from that. You cannot supervise it,
-and it re-derives the same page from scratch on every run.
+## The problem
 
-Website Pet addresses both:
+A browser agent re-solves the same page from scratch on every run. The same LLM calls, the same
+cost, the same latency — and no guarantee it does the same thing twice, because nothing it learned
+last time survived.
 
-- **A visible companion.** A pixel cat lives on the page and physically walks to each element
-  *before* browser-use acts on it. You watch the agent work instead of reconstructing it.
-- **Learned site skills.** Successful runs are recorded as traces. A learner turns repeated traces
-  into a reusable, validated skill for that site, so the second visit is a replay rather than a
-  fresh LLM exploration.
+It also works invisibly. The tab twitches, things get clicked, and you reconstruct what happened
+afterwards from a log. You cannot supervise it, and you cannot stop it in time.
 
----
+## The solution
 
-## The task panel
+**Learn the site once.** Runs are recorded as traces. Repeated traces become a validated, reusable
+skill for that site, so the second visit is a replay instead of a fresh exploration.
 
-<a id="the-task-panel"></a>
+**Show the work.** A pixel cat walks to each element before the agent acts on it, and a panel
+narrates every step. You watch it work, and there is a Stop button under your cursor the whole time.
 
-![The panel reading "Filling portfolio" while the cat stands at the field it is typing into](docs/pet/cat-at-target.jpg)
+## How it works
 
-Click the cat and a panel opens anchored to wherever it is standing: type a task, press Run. While a
-task is active the task box is replaced by **Stop** and the panel narrates each step — above, it is
-part-way through the form, standing at the field it is filling. It also surfaces the agent's
-questions and takes your reply inline.
+**A skill is a schema, not generated code.** The obvious approach — have the LLM write a script —
+fails in repetitive ways: invented selector syntax, hardcoded month names, brittle date parsing.
+`pet_skill_steps.py` makes those unrepresentable. A skill is a validated list of steps run by one
+interpreter, so the model fills in a structure it cannot violate.
 
----
+**Learning is proposal-only.** `pet_skill_learner.py` never installs what it learns — it writes a
+candidate for review (`--propose-skill example.com`). An agent that silently rewrites its own
+behaviour after a run it *thinks* went well is one you cannot trust.
+
+**It never drives the page by accident.** `key-trap.js` runs at `document_start` and swallows
+keystrokes originating in the pet UI. Without it, typing a task while sitting on a game or an editor
+would drive the page underneath — arrow keys moving tiles while you type.
 
 ## What I built
 
-| Path | Lines | What it does |
+| Path | Lines | |
 |---|---:|---|
-| `browser_use/pet.py` | 2,359 | aiohttp bridge on `127.0.0.1:8765`; owns the task lifecycle, agent questions, stop control |
-| `browser_use/pet_skill_learner.py` | 453 | turns recorded traces into proposed site skills |
-| `browser_use/pet_skill_context.py` | 423 | the browser interaction surface a skill is allowed to touch |
-| `browser_use/pet_trace.py` | 423 | per-run operation traces — the training data for skills |
+| `browser_use/pet.py` | 2,359 | bridge on `127.0.0.1:8765` — task lifecycle, questions, stop |
+| `browser_use/pet_skill_learner.py` | 453 | turns traces into proposed skills |
+| `browser_use/pet_skill_context.py` | 423 | the surface a skill is allowed to touch |
+| `browser_use/pet_trace.py` | 423 | run traces — the training data for skills |
 | `browser_use/pet_skills.py` | 280 | skill registry: load, match, execute |
-| `browser_use/pet_skill_steps.py` | 277 | declarative step schema + interpreter |
+| `browser_use/pet_skill_steps.py` | 277 | step schema + interpreter |
 | `browser_use/pet_memory.py` | 249 | per-site memory and reflections |
-| `browser_use/pet_extension/` | — | Chrome extension: PixiJS cat, task panel, key trap, background proxy |
+| `browser_use/pet_extension/` | — | Chrome extension: PixiJS cat, task panel, key trap |
 | `browser_use/llm/openclaw/` | — | `ChatOpenClaw` provider |
-| `tests/ci/test_pet_*.py` | 1,232 | tests for the above |
+| `tests/ci/test_pet_*.py` | 1,232 | tests |
 
-Plus the changes to browser-use itself that the pet depends on: coordinate clicking, DOM serializer
-output, watchdog and tools changes. `git log` credits upstream for everything else.
+Plus the browser-use internals the pet needs: coordinate clicking, DOM serializer output, watchdog
+and tools changes.
 
----
+## Run it
 
-## The ideas worth reading the code for
-
-### 1. A skill is a validated step list, not generated code
-
-The obvious way to make an agent "learn a site" is to have the LLM write a script. That fails in
-boring, repetitive ways: invented selector syntax, hardcoded month names, brittle date parsing.
-
-`pet_skill_steps.py` makes those mistakes **unrepresentable**. A skill is a schema-validated list of
-steps, and a single interpreter executes every skill through one `SkillContext`. The LLM's job is
-reduced to filling in a structure it cannot violate — it never emits executable code.
-
-### 2. Learning is proposal-only
-
-`pet_skill_learner.py` never installs what it learns. It reads recent traces and writes a *candidate*:
+Python 3.11+, and a Chrome started with remote debugging.
 
 ```bash
-python -m browser_use.pet --propose-skill example.com
+uv sync                    # or: pip install -e .
+python -m browser_use.pet  # bridge on 127.0.0.1:8765
 ```
 
-An agent that silently rewrites its own behaviour after a run it thinks went well is an agent you
-cannot trust. A proposal you review is one you can.
+Load `browser_use/pet_extension/` at `chrome://extensions` → Developer mode → **Load unpacked**.
+Open any page, click the extension icon to deploy the pet there, then click the cat and type a task.
 
-### 3. (a smaller one) The pet never drives the page by accident
-
-`pet_extension/key-trap.js` runs at `document_start`, before the page's own scripts, and swallows
-keystrokes that originate inside the pet UI. Without it, typing a task into the pet while sitting on
-a game or an editor would also drive the page — arrow keys moving 2048 tiles underneath you. It
-stops propagation without calling `preventDefault`, so your text still lands in the pet's field.
-
----
-
-## How it fits together
-
-```text
-Chrome tab
-  │  pet_extension/  ── cat companion (PixiJS) + task panel (shadow DOM)
-  │        │  background.js proxies to the bridge
-  ▼        ▼
-http://127.0.0.1:8765         browser_use/pet.py   (aiohttp bridge)
-  │                                   │
-  │  POST /tasks  GET /status         │  matches a learned skill for this site?
-  │  POST /reply  POST /stop          │
-  │                        ┌──────────┴──────────┐
-  │                     yes│                     │no
-  │                        ▼                     ▼
-  │              pet_skills.py            browser-use Agent
-  │              (replay steps)           (LLM explores)
-  │                        └──────────┬──────────┘
-  │                                   ▼
-  │                            pet_trace.py  ── records the run
-  │                                   ▼
-  └───────────── cat walks to each target before the action fires
-                                      ▼
-                        pet_skill_learner.py  ── proposes a skill
-```
-
----
-
-## Setup
-
-Requires Python 3.11+ and a Chrome started with remote debugging.
-
-```bash
-git clone https://github.com/ashahrourr/skill-learning-browser-agent
-cd skill-learning-browser-agent
-uv sync                      # or: pip install -e .
-```
-
-Start the bridge:
-
-```bash
-python -m browser_use.pet
-# Website Pet bridge listening on http://127.0.0.1:8765
-```
-
-Load the extension: Chrome → `chrome://extensions` → Developer mode → **Load unpacked** →
-`browser_use/pet_extension/`.
-
-Then open any page and click the extension icon to deploy the pet to that site. The cat appears;
-click it to open the task panel, type what you want, press Run.
-
-```
---host / --port        bridge address (default 127.0.0.1:8765)
---cdp-url              Chrome CDP URL; auto-discovers a debug-enabled Chrome by default
---max-steps            cap agent steps
---log-dir              per-tab logs        (default .pet_logs/)
---site-dir             per-site memory     (default .pet_sites/)
---propose-skill SITE   propose a skill from recent traces instead of serving
-```
-
-### Animation check
-
-With the extension loaded, keys `1`–`7` cycle the cat's states: idle, walk, jump, sleep, lick,
-click, success. Sleep and lick fall back to idle — the free sprite pack does not include those
-sheets.
-
----
-
-## Verified
-
-The bridge, the extension, the cat and the task panel were run end to end against a local form
-before this README was written; the GIF above is that session, not a mock-up. Health check:
-
-```bash
-$ curl -s 127.0.0.1:8765/health
-{"ok": true}
-$ curl -s "127.0.0.1:8765/status?session_id=tab:1"
-{"state": "idle", "message": "Ready", "question": null, "task_id": null}
-```
-
-Running a full task additionally needs an LLM configured for `ChatOpenClaw`.
-
----
-
-## Why this repo contains all of browser-use
-
-The pet depends on changes to browser-use's own click and DOM internals, so it will not run against
-the released package. Rather than ship something that cannot be run, this repository is a full copy
-with my layer on top. Upstream's README is preserved as
-[README.browser-use.md](./README.browser-use.md) and its licence is unchanged; `git log` credits
-upstream for the other 9,288 commits.
-
-## Credits
-
-- **browser-use** — MIT, Magnus Müller / Nick Sweeting / Gregor Žunič and contributors.
-  See [LICENSE](./LICENSE) and [README.browser-use.md](./README.browser-use.md).
-- **Cat sprites** — *Cat 2D Pixel Art* pack by **Mattz Art**. Check the pack's own licence
-  terms before redistributing; swap `browser_use/pet_extension/public/assets/cat/` to use different
-  sprites.
-- **PixiJS** — MIT.
+<sub>Built on [browser-use](https://github.com/browser-use/browser-use) (MIT) — kept as a full copy
+because the pet depends on the internals above and will not run against the released package.
+Upstream's README is [here](./README.browser-use.md); extension detail is in
+[`pet_extension/README.md`](browser_use/pet_extension/README.md).</sub>
